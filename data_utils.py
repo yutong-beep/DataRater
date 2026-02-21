@@ -116,11 +116,11 @@ def _detect_sequence_columns(dataset: Dataset) -> Tuple[str, Optional[str], str]
     cols = dataset.column_names
     col_lower = {c.lower(): c for c in cols}
 
-    # Sequence columns
-    seq_candidates_1 = ["seq1", "sequence_1", "protein_1", "seq_1", "protein1"]
-    seq_candidates_2 = ["seq2", "sequence_2", "protein_2", "seq_2", "protein2"]
+    # Sequence columns (新增了 Bindwell 官方用的 protein1_sequence 和 pkd 等字段)
+    seq_candidates_1 = ["protein1_sequence", "seq1", "sequence_1", "protein_1", "seq_1", "protein1"]
+    seq_candidates_2 = ["protein2_sequence", "seq2", "sequence_2", "protein_2", "seq_2", "protein2"]
     seq_single = ["sequence", "protein", "seq", "text"]
-    target_candidates = ["affinity", "label", "target", "binding_affinity", "score", "y"]
+    target_candidates = ["pkd", "affinity", "label", "target", "binding_affinity", "score", "y"]
 
     def _find(candidates):
         for c in candidates:
@@ -138,6 +138,10 @@ def _detect_sequence_columns(dataset: Dataset) -> Tuple[str, Optional[str], str]
         # fallback: last numeric-looking column
         target = cols[-1]
 
+    # 终极防御：如果真的全没找到，直接打印出实际存在的列名，防止静默抛 None 崩溃
+    if s1 is None:
+        raise ValueError(f"Sequence column auto-detection failed. Available columns are: {cols}")
+        
     logger.info(f"Detected columns — seq1: {s1}, seq2: {s2}, target: {target}")
     return s1, s2, target
 
