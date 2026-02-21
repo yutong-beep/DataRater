@@ -35,19 +35,53 @@ def download_and_split(
     """
     Download Bindwell/PPBA from HuggingFace.
     Randomly split into 0.8 train (inner) / 0.2 val (outer).
-
-    Returns:
-        (train_dataset, val_dataset)  — raw HF Dataset objects (before tokenization)
+    Contains robust fallback for HuggingFace Server 500 errors.
     """
     logger.info(f"Downloading dataset: {dataset_name}")
-    ds = load_dataset(dataset_name, cache_dir=cache_dir)
+    
+    try:
+        # 尝试 1：标准的 HuggingFace 加载方式
+        ds = load_dataset(dataset_name, cache_dir=cache_dir)
+    except Exception as e:
+        logger.warning(f"Standard HF load_dataset failed ({e}). Falling back to direct HuggingFace Hub download...")
+        
+        # 尝试 2：强力回退机制，直接扒取 HF 仓库底层文件，绕过坏掉的 API
+        repo_files = list_repo_files(repo_id=dataset_name, repo_type="dataset")
+        # 找出所有的数据文件
+        data_files = [f for f in repo_files if f.endswith('.parquet') or f.endswith('.csv')]
+        
+        if not data_files:
+            raise FileNotFoundError(f"Could not find any .parquet or .csv files in HF repo {dataset_name}.")
+            
+        dfs = []
+        for file in data_files:
+            try:
+                logger.info(f"Force downloading raw file: {file}")
+                local_path = hf_hub_download(
+                    repo_id=dataset_name, 
+                    filename=file, 
+                    repo_type="dataset", 
+                    cache_dir=cache_dir
+                )
+                if file.endswith('.parquet'):
+                    dfs.append(pd.read_parquet(local_path))
+                elif file.endswith('.csv'):
+                    dfs.append(pd.read_csv(local_path))
+            except Exception as dl_e:
+                # 忽略坏掉的 LFS 指针文件，继续加载好的文件
+                logger.error(f"Could not download/read {file}, skipping: {dl_e}")
+                
+        if not dfs:
+            raise RuntimeError("Failed to download any valid data files from the repository.")
+            
+        # 拼装成完好的 Hugging Face Dataset
+        full_df = pd.concat(dfs, ignore_index=True)
+        ds = Dataset.from_pandas(full_df)
 
-    # The dataset may have a single 'train' split or multiple.
-    # Merge all splits into one, then re-split.
+    # 统一处理 splits (合并所有数据后重新切分)
     if isinstance(ds, dict):
         all_splits = list(ds.keys())
         logger.info(f"Available splits: {all_splits}")
-        # Use 'train' if it exists, else concatenate all
         if "train" in ds:
             full = ds["train"]
         else:
@@ -58,9 +92,8 @@ def download_and_split(
 
     logger.info(f"Total samples: {len(full)}")
     logger.info(f"Columns: {full.column_names}")
-    logger.info(f"Sample row: {full[0]}")
-
-    # Split
+    
+    # 切分 Train 和 Val
     split = full.train_test_split(test_size=1 - train_ratio, seed=seed)
     train_ds = split["train"]
     val_ds = split["test"]
