@@ -1,19 +1,18 @@
 """
-data_utils.py — Download Bindwell/PPBA, tokenize, split, build DataLoaders.
+data_utils.py — Strictly download Bindwell/PPBA (whitelist), clean sequences,
+tokenize, split, and build DataLoaders.
 """
 
-import os
-import json
+import math
 import logging
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 
 import torch
-from torch.utils.data import DataLoader
-from datasets import load_dataset, Dataset
-from transformers import AutoTokenizer
-
 import pandas as pd
-from huggingface_hub import list_repo_files, hf_hub_download
+from torch.utils.data import DataLoader
+from datasets import Dataset
+from transformers import AutoTokenizer
+from huggingface_hub import hf_hub_download
 
 logger = logging.getLogger(__name__)
 
@@ -25,98 +24,87 @@ DEFAULT_MAX_LEN = 512
 DEFAULT_BATCH_SIZE = 64
 DEFAULT_SEED = 42
 
+# Exact whitelist from Bindwell/PPBA repo
+WHITELIST_FILES = [
+    "ATLAS.parquet",
+    "Affinity_Benchmark.parquet",
+    "Combined_train.parquet",
+    "PDBbind_v2020.parquet",
+    "PDZ_PBM.parquet",
+    "SAbDab.parquet",
+    "SKEMPIv2.0.parquet",
+]
+
 
 # ==========================================
-# Download & Split
+# Download & Split (Strict Whitelist)
 # ==========================================
 def download_and_split(
     dataset_name: str = "Bindwell/PPBA",
     train_ratio: float = 0.8,
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
+    mode: str = "combined_train",  # "combined_train" (recommended) or "all"
 ) -> Tuple[Dataset, Dataset]:
     """
-    Download Bindwell/PPBA from HuggingFace.
-    Randomly split into 0.8 train (inner) / 0.2 val (outer).
-    Contains robust fallback for HuggingFace Server 500 errors.
+    Strictly load dataset via hf_hub_download + pandas parquet reading,
+    avoiding HF dataset config pitfalls completely.
+
+    mode:
+      - "combined_train": only load Combined_train.parquet (recommended)
+      - "all": load and concat all WHITELIST_FILES
     """
-    logger.info(f"Downloading dataset: {dataset_name}")
-    
-    try:
-        # 尝试 1：标准的 HuggingFace 加载方式
-        ds = load_dataset(dataset_name, cache_dir=cache_dir)
-    except Exception as e:
-        logger.warning(f"Standard HF load_dataset failed ({e}). Falling back to direct HuggingFace Hub download...")
-        
-        # 尝试 2：强力回退机制，直接扒取 HF 仓库底层文件，绕过坏掉的 API
-        repo_files = list_repo_files(repo_id=dataset_name, repo_type="dataset")
-        # 找出所有的数据文件
-        data_files = [f for f in repo_files if f.endswith('.parquet') or f.endswith('.csv')]
-        
-        if not data_files:
-            raise FileNotFoundError(f"Could not find any .parquet or .csv files in HF repo {dataset_name}.")
-            
-        dfs = []
-        for file in data_files:
-            try:
-                logger.info(f"Force downloading raw file: {file}")
-                local_path = hf_hub_download(
-                    repo_id=dataset_name, 
-                    filename=file, 
-                    repo_type="dataset", 
-                    cache_dir=cache_dir
-                )
-                if file.endswith('.parquet'):
-                    dfs.append(pd.read_parquet(local_path))
-                elif file.endswith('.csv'):
-                    dfs.append(pd.read_csv(local_path))
-            except Exception as dl_e:
-                # 忽略坏掉的 LFS 指针文件，继续加载好的文件
-                logger.error(f"Could not download/read {file}, skipping: {dl_e}")
-                
-        if not dfs:
-            raise RuntimeError("Failed to download any valid data files from the repository.")
-            
-        # 拼装成完好的 Hugging Face Dataset
-        full_df = pd.concat(dfs, ignore_index=True)
-        ds = Dataset.from_pandas(full_df)
+    logger.info(f"Downloading dataset (strict whitelist): {dataset_name} | mode={mode}")
 
-    # 统一处理 splits (合并所有数据后重新切分)
-    if isinstance(ds, dict):
-        all_splits = list(ds.keys())
-        logger.info(f"Available splits: {all_splits}")
-        if "train" in ds:
-            full = ds["train"]
-        else:
-            from datasets import concatenate_datasets
-            full = concatenate_datasets([ds[s] for s in all_splits])
-    else:
-        full = ds
+    if mode not in {"combined_train", "all"}:
+        raise ValueError("mode must be 'combined_train' or 'all'")
 
-    logger.info(f"Total samples: {len(full)}")
+    files_to_load = ["Combined_train.parquet"] if mode == "combined_train" else list(WHITELIST_FILES)
+
+    dfs: List[pd.DataFrame] = []
+    per_file_counts: Dict[str, int] = {}
+
+    for fn in files_to_load:
+        logger.info(f"Downloading parquet: {fn}")
+        local_path = hf_hub_download(
+            repo_id=dataset_name,
+            filename=fn,
+            repo_type="dataset",
+            cache_dir=cache_dir,
+        )
+        df = pd.read_parquet(local_path)
+        df = df.dropna(how="all")
+        per_file_counts[fn] = len(df)
+        dfs.append(df)
+
+    logger.info("Loaded parquet files:")
+    for k, v in per_file_counts.items():
+        logger.info(f"  - {k}: {v} rows")
+
+    full_df = pd.concat(dfs, ignore_index=True)
+    full = Dataset.from_pandas(full_df, preserve_index=False)
+
+    logger.info(f"Total samples before splitting: {len(full)}")
     logger.info(f"Columns: {full.column_names}")
-    
-    # 切分 Train 和 Val
-    split = full.train_test_split(test_size=1 - train_ratio, seed=seed)
+
+    split = full.train_test_split(test_size=1 - train_ratio, seed=seed, shuffle=True)
     train_ds = split["train"]
     val_ds = split["test"]
-    logger.info(f"Train (inner): {len(train_ds)} | Val (outer): {len(val_ds)}")
 
+    logger.info(f"Train (inner): {len(train_ds)} | Val (outer): {len(val_ds)}")
     return train_ds, val_ds
 
 
 # ==========================================
-# Tokenization
+# Tokenization helpers
 # ==========================================
 def _detect_sequence_columns(dataset: Dataset) -> Tuple[str, Optional[str], str]:
     """
-    Auto-detect column names for seq1, seq2 (optional), and affinity target.
-    Returns (seq_col_1, seq_col_2_or_None, target_col).
+    Auto-detect column names for seq1, seq2 (optional), and target.
     """
     cols = dataset.column_names
     col_lower = {c.lower(): c for c in cols}
 
-    # Sequence columns (新增了 Bindwell 官方用的 protein1_sequence 和 pkd 等字段)
     seq_candidates_1 = ["protein1_sequence", "seq1", "sequence_1", "protein_1", "seq_1", "protein1"]
     seq_candidates_2 = ["protein2_sequence", "seq2", "sequence_2", "protein_2", "seq_2", "protein2"]
     seq_single = ["sequence", "protein", "seq", "text"]
@@ -128,22 +116,28 @@ def _detect_sequence_columns(dataset: Dataset) -> Tuple[str, Optional[str], str]
                 return col_lower[c.lower()]
         return None
 
-    s1 = _find(seq_candidates_1)
+    s1 = _find(seq_candidates_1) or _find(seq_single)
     s2 = _find(seq_candidates_2)
-    target = _find(target_candidates)
+    target = _find(target_candidates) or cols[-1]
 
     if s1 is None:
-        s1 = _find(seq_single)
-    if target is None:
-        # fallback: last numeric-looking column
-        target = cols[-1]
+        raise ValueError(f"Sequence column auto-detection failed. Available columns: {cols}")
 
-    # 终极防御：如果真的全没找到，直接打印出实际存在的列名，防止静默抛 None 崩溃
-    if s1 is None:
-        raise ValueError(f"Sequence column auto-detection failed. Available columns are: {cols}")
-        
     logger.info(f"Detected columns — seq1: {s1}, seq2: {s2}, target: {target}")
     return s1, s2, target
+
+
+def _clean_protein_seq(s: str) -> str:
+    """
+    Clean protein sequence:
+      - remove whitespace/newlines
+      - uppercase
+      - replace non-standard amino acids with 'X'
+    """
+    s = s.replace(" ", "").replace("\n", "").replace("\r", "").upper()
+    allowed = set("ACDEFGHIKLMNPQRSTVWY")
+    s = "".join(ch if ch in allowed else "X" for ch in s)
+    return s
 
 
 def tokenize_dataset(
@@ -152,36 +146,94 @@ def tokenize_dataset(
     model_name: str = ESM_MODEL_NAME,
 ) -> Dataset:
     """
-    Tokenize protein sequences and prepare 'input_ids', 'attention_mask', 'affinity'.
-
-    For pair datasets (two sequences), we concatenate with a separator.
-    For single-sequence datasets, we tokenize directly.
+    Tokenize protein sequences and prepare columns: input_ids, attention_mask, affinity.
+    Filters malformed rows (missing sequence or missing/non-numeric target).
+    Always returns python lists (not torch tensors) inside map to avoid Arrow issues.
     """
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     seq1_col, seq2_col, target_col = _detect_sequence_columns(dataset)
+    cols = dataset.column_names
+
+    # Robust fallbacks
+    target_fallback_cols = [target_col] + [
+        c for c in ["pkd", "affinity", "label", "target", "binding_affinity", "score", "y"]
+        if c in cols and c != target_col
+    ]
+    seq1_fallback_cols = [seq1_col] + [
+        c for c in [
+            "protein1_sequence", "seq1", "sequence_1", "protein_1", "seq_1", "protein1",
+            "sequence", "protein", "seq", "text"
+        ] if c in cols and c != seq1_col
+    ]
+    seq2_fallback_cols: List[str] = []
+    if seq2_col is not None:
+        seq2_fallback_cols = [seq2_col] + [
+            c for c in ["protein2_sequence", "seq2", "sequence_2", "protein_2", "seq_2", "protein2"]
+            if c in cols and c != seq2_col
+        ]
+
+    def _first_valid_str(examples, i: int, candidates: List[str]) -> Optional[str]:
+        for c in candidates:
+            if c not in examples:
+                continue
+            v = examples[c][i]
+            if v is None or pd.isna(v):
+                continue
+            s = str(v).strip()
+            if not s:
+                continue
+            s = _clean_protein_seq(s)
+            if s:
+                return s
+        return None
+
+    def _first_valid_float(examples, i: int, candidates: List[str]) -> Optional[float]:
+        for c in candidates:
+            if c not in examples:
+                continue
+            v = examples[c][i]
+            if v is None or pd.isna(v):
+                continue
+            try:
+                f = float(v)
+                if math.isnan(f):
+                    continue
+                return f
+            except (TypeError, ValueError):
+                continue
+        return None
 
     def _tokenize_fn(examples):
         seqs = []
-        n = len(examples[seq1_col])
+        affinities = []
+
+        # safest way to get batch size
+        n = len(next(iter(examples.values())))
+
         for i in range(n):
-            s1 = str(examples[seq1_col][i])
-            if seq2_col is not None:
-                s2 = str(examples[seq2_col][i])
-                # Concatenate pair: "SEQ1<sep>SEQ2" — simple concat for ESM
-                seqs.append(s1 + s2)
+            s1 = _first_valid_str(examples, i, seq1_fallback_cols)
+            y = _first_valid_float(examples, i, target_fallback_cols)
+            if s1 is None or y is None:
+                continue
+
+            if seq2_fallback_cols:
+                s2 = _first_valid_str(examples, i, seq2_fallback_cols)
+                # conservative concat (no special token injection)
+                seqs.append(s1 if s2 is None else (s1 + s2))
             else:
                 seqs.append(s1)
+
+            affinities.append(y)
+
+        if not seqs:
+            return {"input_ids": [], "attention_mask": [], "affinity": []}
 
         tok = tokenizer(
             seqs,
             padding="max_length",
             truncation=True,
             max_length=max_length,
-            return_tensors="pt",
         )
-
-        # Parse affinity to float
-        affinities = [float(v) for v in examples[target_col]]
 
         return {
             "input_ids": tok["input_ids"],
@@ -194,8 +246,11 @@ def tokenize_dataset(
         batched=True,
         batch_size=512,
         remove_columns=dataset.column_names,
-        desc="Tokenizing",
+        desc="Tokenizing & Filtering",
     )
+
+    logger.info(f"After filtering and tokenizing, dataset size: {len(tokenized)} samples")
+
     tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "affinity"])
     return tokenized
 
@@ -209,17 +264,14 @@ def build_dataloaders(
     batch_size: int = DEFAULT_BATCH_SIZE,
     num_workers: int = 2,
 ) -> Tuple[DataLoader, DataLoader]:
-    """Build DataLoaders with proper collation."""
-
+    """
+    Build DataLoaders with explicit collate function.
+    """
     def _collate(batch):
         input_ids = torch.stack([b["input_ids"] for b in batch])
         attention_mask = torch.stack([b["attention_mask"] for b in batch])
         affinity = torch.tensor([b["affinity"] for b in batch], dtype=torch.float32)
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "affinity": affinity,
-        }
+        return {"input_ids": input_ids, "attention_mask": attention_mask, "affinity": affinity}
 
     train_loader = DataLoader(
         train_ds,
@@ -252,17 +304,22 @@ def prepare_data(
     train_ratio: float = 0.8,
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
+    mode: str = "combined_train",  # "combined_train" or "all"
 ) -> Tuple[DataLoader, DataLoader, Dataset, Dataset]:
     """
     One-call: download -> split -> tokenize -> dataloaders.
-
-    Returns:
-        (train_loader, val_loader, train_dataset_tokenized, val_dataset_tokenized)
+    Returns: (train_loader, val_loader, train_dataset_tokenized, val_dataset_tokenized)
     """
-    train_raw, val_raw = download_and_split(dataset_name, train_ratio, seed, cache_dir)
-    train_tok = tokenize_dataset(train_raw, max_length)
-    val_tok = tokenize_dataset(val_raw, max_length)
-    train_loader, val_loader = build_dataloaders(train_tok, val_tok, batch_size)
+    train_raw, val_raw = download_and_split(
+        dataset_name=dataset_name,
+        train_ratio=train_ratio,
+        seed=seed,
+        cache_dir=cache_dir,
+        mode=mode,
+    )
+    train_tok = tokenize_dataset(train_raw, max_length=max_length, model_name=ESM_MODEL_NAME)
+    val_tok = tokenize_dataset(val_raw, max_length=max_length, model_name=ESM_MODEL_NAME)
+    train_loader, val_loader = build_dataloaders(train_tok, val_tok, batch_size=batch_size)
 
     logger.info(f"DataLoaders ready — train: {len(train_loader)} batches, val: {len(val_loader)} batches")
     return train_loader, val_loader, train_tok, val_tok
