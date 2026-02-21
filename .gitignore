@@ -1,0 +1,37 @@
+# Data
+data/raw/
+data/processed/
+data/filtered/
+
+# Experiments
+experiments/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Env
+.env
+venv/
+.venv/
+
+# Wandb
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Checkpoints (keep config, remove weights)
+*.pt
+!configs/*.yaml
