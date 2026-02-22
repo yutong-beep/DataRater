@@ -1,224 +1,293 @@
+# model.py
+import math
+import random
+import logging
+from typing import Dict, List, Tuple, Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from transformers import AutoTokenizer, EsmModel
-from datasets import load_dataset
-import random
-import bisect
-import numpy as np
-from scipy.stats import binom
+from transformers import EsmModel
+from torch.func import functional_call
 
-# ==========================================
-# 1. Model Definition (ESM-8M + Regression Head)
-# ==========================================
+logger = logging.getLogger(__name__)
+
+# =========================
+# Backbone + Regressor
+# =========================
+ESM_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"
+ESM_HIDDEN = 320  # esm2_t6_8M hidden size
+
+
 class ESMForAffinity(nn.Module):
-    def __init__(self, model_name="facebook/esm2_t6_8M_UR50D"):
+    """
+    ESM2 encoder + mean pooling + MLP regressor.
+    Includes fast reset without re-downloading weights.
+    """
+    def __init__(self, model_name: str = ESM_MODEL_NAME, cache_init_state: bool = True):
         super().__init__()
+        self.model_name = model_name
+
+        # Load once. (HF will cache locally after first download.)
         self.esm = EsmModel.from_pretrained(model_name)
-        # 320 is the hidden size for ESM-8M
         self.mlp = nn.Sequential(
-            nn.Linear(320, 128),
+            nn.Linear(ESM_HIDDEN, 128),
             nn.ReLU(),
-            nn.Linear(128, 1)
+            nn.Linear(128, 1),
         )
-        
-    def forward(self, input_ids, attention_mask):
+
+        self._init_state = None
+        if cache_init_state:
+            # Store an initial snapshot on CPU (so resets are cheap + no HF calls).
+            self._init_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         outputs = self.esm(input_ids=input_ids, attention_mask=attention_mask)
-        # Mean Pooling over sequence length
-        hidden_states = outputs.last_hidden_state
-        mask_expanded = attention_mask.unsqueeze(-1).expand(hidden_states.size()).float()
-        sum_embeddings = torch.sum(hidden_states * mask_expanded, 1)
-        sum_mask = mask_expanded.sum(1)
-        sum_mask = torch.clamp(sum_mask, min=1e-9)
-        pooled = sum_embeddings / sum_mask
-        
-        # MLP to scalar
-        affinity = self.mlp(pooled)
-        return affinity.squeeze(-1) # Output shape: (Batch, )
+        hidden = outputs.last_hidden_state  # [B, L, H]
 
+        # mean pooling with mask
+        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)  # [B, L, 1]
+        summed = torch.sum(hidden * mask, dim=1)
+        denom = torch.clamp(mask.sum(dim=1), min=1e-9)
+        pooled = summed / denom  # [B, H]
+
+        pred = self.mlp(pooled).squeeze(-1)  # [B]
+        return pred
+
+    @torch.no_grad()
     def reset_parameters(self):
-        # Function to completely re-initialize the model
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                module.reset_parameters()
-        self.esm = EsmModel.from_pretrained("facebook/esm2_t6_8M_UR50D")
+        """
+        Fast reset: restore to cached init weights if available.
+        No from_pretrained() here -> no repeated HF checks/downloads.
+        """
+        if self._init_state is None:
+            # Fallback: reset only linear layers (still no HF calls)
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    m.reset_parameters()
+            return
 
-# Functional forward for Meta-Learning
-def functional_forward(model, params_dict, input_ids, attention_mask):
-    """
-    Simulates a forward pass using explicit parameters dict (fast_weights)
-    to keep the computation graph alive for outer gradients.
-    (In production, libraries like functorch or torchopt are cleaner, 
-    but this represents the fundamental PyTorch mechanic).
-    """
-    # For a complex HuggingFace model, torch.func.functional_call is highly recommended
-    from torch.func import functional_call
-    return functional_call(model, params_dict, (input_ids, attention_mask)).squeeze(-1)
+        self.load_state_dict(self._init_state, strict=True)
 
-# ==========================================
-# 2. Meta-Training Logic (DataRater Bilevel Loop)
-# ==========================================
+    def get_trainable_params(self):
+        return list(self.parameters())
+
+
+def functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], input_ids, attention_mask) -> torch.Tensor:
+    """
+    Forward pass using explicit parameter dict (fast_weights).
+    Keeps computation graph for higher-order grads.
+    """
+    return functional_call(model, params, (input_ids, attention_mask)).squeeze(-1)
+
+
+# =========================
+# Meta-training DataRater
+# =========================
+def _safe_mean(grads: List[Optional[torch.Tensor]], like: torch.Tensor) -> torch.Tensor:
+    """
+    Average gradients, treating None as zero. Returns a tensor with same shape as `like`.
+    """
+    valid = [g for g in grads if g is not None]
+    if not valid:
+        return torch.zeros_like(like)
+    return torch.stack(valid, dim=0).mean(dim=0)
+
+
 def train_datarater(
-    train_loader, val_loader, 
-    n_meta_steps=5000, 
-    n_inner_models=8,
-    lifetime=2000,
-    T_window=2,
-    use_first_order_ablation=False, # Task 'c' (disable backprop through the unrolled state)
-    sample_one_inner=False          # Task 'f' (default False: iterate all 8; True: randomly pick 1)
-):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Init DataRater
-    data_rater = ESMForAffinity().to(device)
+    train_loader,
+    val_loader,
+    n_meta_steps: int = 5000,
+    n_inner_models: int = 8,
+    lifetime: int = 2000,
+    T_window: int = 2,
+    use_first_order_ablation: bool = False,   # your ablation flag
+    sample_one_inner: bool = False,
+    inner_lr: float = 1e-4,
+    tau: float = 0.5,
+    device: Optional[torch.device] = None,
+) -> ESMForAffinity:
+    """
+    Meta-learn a DataRater that assigns per-sample weights.
+
+    - Inner loop uses data_rater weights for weighted MSE.
+    - Outer loop computes validation loss.
+    - Ablation mode: do NOT backprop through unrolled inner updates,
+      but still allow DataRater to learn via a direct outer weighting path.
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # DataRater (heavy, but at least not repeatedly reloaded)
+    data_rater = ESMForAffinity(cache_init_state=True).to(device)
     rater_opt = torch.optim.Adam(data_rater.parameters(), lr=1e-4)
-    
-    # Init Inner Population
-    population = [ESMForAffinity().to(device) for _ in range(n_inner_models)]
-    inner_lr = 1e-4
-    tau = 0.5 # Softmax temperature
-    
+
+    # Inner population (each cached for fast reset)
+    population = [ESMForAffinity(cache_init_state=True).to(device) for _ in range(n_inner_models)]
+
     train_iter = iter(train_loader)
     val_iter = iter(val_loader)
-    
+
     data_rater.train()
+
     for step in range(n_meta_steps):
-        
-        # 1. Staggered resets (Task 'a'): must traverse every model in the outer loop to keep lifetime schedule aligned
+        # Staggered resets (no HF calls now)
         for i, inner_model in enumerate(population):
             offset = (n_inner_models - 1 - i) * (lifetime // n_inner_models)
             if step > 0 and (step + offset) % lifetime == 0:
                 inner_model.reset_parameters()
 
-        # 2. Decide how many models to compute meta-gradients for this step
         if sample_one_inner:
             models_to_process = [random.randint(0, n_inner_models - 1)]
         else:
             models_to_process = list(range(n_inner_models))
-            
-        rater_opt.zero_grad()
+
+        rater_opt.zero_grad(set_to_none=True)
+
         meta_grads_accumulator = []
-        
-        # 3. Process the selected inner models
+
         for m_idx in models_to_process:
             inner_model = population[m_idx]
             fast_weights = dict(inner_model.named_parameters())
-            
-            # --- Inner Loop: Truncated window of 2 ---
-            for t in range(T_window):
+
+            # -------- Inner loop (T steps) --------
+            for _t in range(T_window):
                 try:
                     x_in = next(train_iter)
                 except StopIteration:
                     train_iter = iter(train_loader)
                     x_in = next(train_iter)
-                    
-                input_ids = x_in['input_ids'].to(device)
-                mask = x_in['attention_mask'].to(device)
-                targets = x_in['affinity'].to(device)
-                
-                # DataRater scoring + in-batch Softmax (Task 'd')
-                raw_scores = data_rater(input_ids, mask)
-                weights = F.softmax(raw_scores / tau, dim=0)
-                
-                # Weighted MSE loss
+
+                input_ids = x_in["input_ids"].to(device)
+                mask = x_in["attention_mask"].to(device)
+                targets = x_in["affinity"].to(device)
+
+                # DataRater scores and differentiable weights
+                raw_scores = data_rater(input_ids, mask)              # [B]
+                weights = F.softmax(raw_scores / tau, dim=0)          # [B]
+
                 preds = functional_forward(inner_model, fast_weights, input_ids, mask)
-                mse_per_sample = F.mse_loss(preds, targets, reduction='none')
-                inner_loss = torch.sum(weights * mse_per_sample)
-                
-                # Compute inner gradients
+                per = F.mse_loss(preds, targets, reduction="none")    # [B]
+                inner_loss = torch.sum(weights * per)                 # scalar
+
                 grads = torch.autograd.grad(
-                    inner_loss, 
-                    fast_weights.values(), 
-                    create_graph=not use_first_order_ablation
+                    inner_loss,
+                    tuple(fast_weights.values()),
+                    create_graph=not use_first_order_ablation,
+                    allow_unused=True,
                 )
-                
-                # Task 'c': ablation (if enabled, stop gradients through the unroll)
+
                 if use_first_order_ablation:
-                    grads = [g.detach() for g in grads]
-                    
-                # Functional weight update
-                fast_weights = {name: w - inner_lr * g for (name, w), g in zip(fast_weights.items(), grads)}
-                
-            # --- Outer Loop computation ---
+                    # stop gradients through the unrolled states (fast_weights trajectory)
+                    grads = [g.detach() if g is not None else None for g in grads]
+
+                fast_weights = {
+                    name: (w - inner_lr * g) if g is not None else w
+                    for (name, w), g in zip(fast_weights.items(), grads)
+                }
+
+            # -------- Outer loop --------
             try:
                 x_out = next(val_iter)
             except StopIteration:
                 val_iter = iter(val_loader)
                 x_out = next(val_iter)
-                
-            out_input_ids = x_out['input_ids'].to(device)
-            out_mask = x_out['attention_mask'].to(device)
-            out_targets = x_out['affinity'].to(device)
-            
-            # Compute outer loss using weights after T steps
-            outer_preds = functional_forward(inner_model, fast_weights, out_input_ids, out_mask)
-            outer_loss = F.mse_loss(outer_preds, out_targets, reduction='mean')
-            
-            # Compute meta-gradients and store in accumulator
-            meta_grads = torch.autograd.grad(outer_loss, data_rater.parameters())
+
+            out_ids = x_out["input_ids"].to(device)
+            out_mask = x_out["attention_mask"].to(device)
+            out_targets = x_out["affinity"].to(device)
+
+            outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
+            outer_per = F.mse_loss(outer_preds, out_targets, reduction="none")
+
+            if use_first_order_ablation:
+                # Key: Make outer loss directly depend on DataRater (so it can still learn)
+                out_scores = data_rater(out_ids, out_mask)
+                out_w = F.softmax(out_scores / tau, dim=0)
+                outer_loss = torch.sum(out_w * outer_per)
+            else:
+                outer_loss = outer_per.mean()
+
+            # meta-grad wrt DataRater params (never crash; None means truly disconnected)
+            meta_grads = torch.autograd.grad(
+                outer_loss,
+                tuple(data_rater.parameters()),
+                allow_unused=True,
+            )
             meta_grads_accumulator.append(meta_grads)
-            
-            # Sync parameters and fully detach the graph (Task 'b')
+
+            # Sync back to the actual inner model (truncate graph)
             with torch.no_grad():
-                for name, param in inner_model.named_parameters():
-                    param.copy_(fast_weights[name].detach())
-                    
-        # 4. Average meta-gradients and update DataRater
-        for rater_param, meta_grads_for_this_param in zip(data_rater.parameters(), zip(*meta_grads_accumulator)):
-            # Stack meta-grads from all models handled this step (8 or 1) and average
-            rater_param.grad = torch.stack(meta_grads_for_this_param).mean(dim=0)
-            
+                for name, p in inner_model.named_parameters():
+                    p.copy_(fast_weights[name].detach())
+
+        # -------- Update DataRater: average per-param grads --------
+        params = list(data_rater.parameters())
+        # transpose list-of-tuples: [(g1p1,g1p2,...), (g2p1,g2p2,...)] -> per param
+        for p, grads_for_p in zip(params, zip(*meta_grads_accumulator)):
+            p.grad = _safe_mean(list(grads_for_p), p)
+
         rater_opt.step()
-        
+
+        if (step + 1) % 50 == 0:
+            # light logging
+            gnorm = 0.0
+            with torch.no_grad():
+                for p in data_rater.parameters():
+                    if p.grad is not None:
+                        gnorm += float(p.grad.norm().item())
+            logger.info(f"[meta] step {step+1}/{n_meta_steps} | grad_norm_sum={gnorm:.4f}")
+
     return data_rater
 
-# ==========================================
-# 3. CDF Building and Dataset Filtering (Task 'd')
-# ==========================================
+
+# =========================
+# Dataset filtering (kept as-is, but note: uses no_grad and .item() on purpose)
+# =========================
 def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=0.7):
+    """
+    NOTE: This is a non-differentiable filtering stage by design (uses .item()).
+    It should be used AFTER meta-training, not inside the differentiable loop.
+    """
+    import bisect
+    import numpy as np
+    from scipy.stats import binom
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     data_rater.eval()
-    
+
     print(f"Building Empirical CDF using {N_ref} random samples...")
-    # Get N_ref random samples
-    indices = random.sample(range(len(original_dataset)), N_ref)
+    indices = random.sample(range(len(original_dataset)), min(N_ref, len(original_dataset)))
     ref_scores = []
-    
+
     with torch.no_grad():
         for idx in indices:
             sample = original_dataset[idx]
-            # Assumes collate handles adding batch dim
-            input_ids = sample['input_ids'].unsqueeze(0).to(device)
-            mask = sample['attention_mask'].unsqueeze(0).to(device)
+            input_ids = sample["input_ids"].unsqueeze(0).to(device)
+            mask = sample["attention_mask"].unsqueeze(0).to(device)
             score = data_rater(input_ids, mask).item()
             ref_scores.append(score)
-            
-    ref_scores.sort() # CDF Lookup Table
-    
+
+    ref_scores.sort()
+
     K = int(B * keep_ratio)
     filtered_indices = []
-    
-    print("Filtering dataset using P_accept(x)...")
+
+    print("Filtering dataset using P_accept formula...")
     with torch.no_grad():
         for idx in range(len(original_dataset)):
             sample = original_dataset[idx]
-            input_ids = sample['input_ids'].unsqueeze(0).to(device)
-            mask = sample['attention_mask'].unsqueeze(0).to(device)
-            
-            # Score individually
+            input_ids = sample["input_ids"].unsqueeze(0).to(device)
+            mask = sample["attention_mask"].unsqueeze(0).to(device)
+
             score = data_rater(input_ids, mask).item()
-            
-            # Find percentile 'p'
             pos = bisect.bisect_left(ref_scores, score)
-            p = pos / N_ref
-            
-            # P_accept formula from DataRater
+            p = pos / max(1, len(ref_scores))
+
             p_accept = binom.cdf(K - 1, B - 1, 1 - p)
-            
             if random.random() < p_accept:
                 filtered_indices.append(idx)
-                
+
     filtered_dataset = original_dataset.select(filtered_indices)
     print(f"Original size: {len(original_dataset)}, Filtered size: {len(filtered_dataset)}")
     return filtered_dataset
