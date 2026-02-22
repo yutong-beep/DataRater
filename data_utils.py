@@ -203,9 +203,10 @@ def tokenize_dataset(
                 continue
         return None
 
-    def _tokenize_fn(examples):
+    def _tokenize_fn(examples, indices):
         seqs = []
         affinities = []
+        raw_indices = []
 
         # safest way to get batch size
         n = len(next(iter(examples.values())))
@@ -224,9 +225,10 @@ def tokenize_dataset(
                 seqs.append(s1)
 
             affinities.append(y)
+            raw_indices.append(int(indices[i]))
 
         if not seqs:
-            return {"input_ids": [], "attention_mask": [], "affinity": []}
+            return {"input_ids": [], "attention_mask": [], "affinity": [], "raw_index": []}
 
         tok = tokenizer(
             seqs,
@@ -239,11 +241,13 @@ def tokenize_dataset(
             "input_ids": tok["input_ids"],
             "attention_mask": tok["attention_mask"],
             "affinity": affinities,
+            "raw_index": raw_indices,
         }
 
     tokenized = dataset.map(
         _tokenize_fn,
         batched=True,
+        with_indices=True,
         batch_size=512,
         remove_columns=dataset.column_names,
         desc="Tokenizing & Filtering",
@@ -251,7 +255,7 @@ def tokenize_dataset(
 
     logger.info(f"After filtering and tokenizing, dataset size: {len(tokenized)} samples")
 
-    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "affinity"])
+    tokenized.set_format(type="torch", columns=["input_ids", "attention_mask", "affinity", "raw_index"])
     return tokenized
 
 
@@ -305,10 +309,11 @@ def prepare_data(
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
     mode: str = "combined_train",  # "combined_train" or "all"
-) -> Tuple[DataLoader, DataLoader, Dataset, Dataset]:
+) -> Tuple[DataLoader, DataLoader, Dataset, Dataset, Dataset, Dataset]:
     """
     One-call: download -> split -> tokenize -> dataloaders.
-    Returns: (train_loader, val_loader, train_dataset_tokenized, val_dataset_tokenized)
+    Returns:
+      (train_loader, val_loader, train_dataset_tokenized, val_dataset_tokenized, train_dataset_raw, val_dataset_raw)
     """
     train_raw, val_raw = download_and_split(
         dataset_name=dataset_name,
@@ -322,4 +327,4 @@ def prepare_data(
     train_loader, val_loader = build_dataloaders(train_tok, val_tok, batch_size=batch_size)
 
     logger.info(f"DataLoaders ready — train: {len(train_loader)} batches, val: {len(val_loader)} batches")
-    return train_loader, val_loader, train_tok, val_tok
+    return train_loader, val_loader, train_tok, val_tok, train_raw, val_raw

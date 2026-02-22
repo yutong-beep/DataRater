@@ -29,6 +29,7 @@ def run_meta_training(
     n_inner_models: int = 8,
     lifetime: int = 2000,
     T_window: int = 2,
+    temperature: float = 0.5,
     use_first_order_ablation: bool = False,
     sample_one_inner: bool = False,
     save_dir: str = "checkpoints/datarater",
@@ -49,6 +50,7 @@ def run_meta_training(
         "n_inner_models": n_inner_models,
         "lifetime": lifetime,
         "T_window": T_window,
+        "temperature": temperature,
         "use_first_order_ablation": use_first_order_ablation,
         "sample_one_inner": sample_one_inner,
     }
@@ -70,6 +72,7 @@ def run_meta_training(
         n_inner_models=n_inner_models,
         lifetime=lifetime,
         T_window=T_window,
+        tau=temperature,
         use_first_order_ablation=use_first_order_ablation,
         sample_one_inner=sample_one_inner,
     )

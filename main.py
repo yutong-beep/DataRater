@@ -62,6 +62,8 @@ def parse_args():
                    help="Inner model lifetime before re-init")
     p.add_argument("--T_window", type=int, default=2,
                    help="Truncated inner loop window")
+    p.add_argument("--temperature", type=float, default=0.5,
+                   help="Softmax temperature tau used by DataRater in meta-training")
     p.add_argument("--ablation", action="store_true",
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
@@ -165,7 +167,7 @@ def main():
     from data_utils import prepare_data
 
     # Uses the standard base batch_size (64)
-    train_loader, val_loader, train_dataset, val_dataset = prepare_data(
+    train_loader, val_loader, train_dataset, val_dataset, train_raw_dataset, val_raw_dataset = prepare_data(
         dataset_name=args.dataset,
         max_length=args.max_length,
         batch_size=args.batch_size,
@@ -240,6 +242,7 @@ def main():
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
             T_window=args.T_window,
+            temperature=args.temperature,
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
             save_dir=phase2_dir,
@@ -276,6 +279,7 @@ def main():
         filtered_dataset, filter_stats = run_scoring_and_filtering(
             data_rater=data_rater,
             train_dataset=train_dataset,
+            raw_train_dataset=train_raw_dataset,
             N_ref=min(args.N_ref, len(train_dataset)),
             B=args.B,
             keep_ratio=args.keep_ratio,

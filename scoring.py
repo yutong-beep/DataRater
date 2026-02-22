@@ -23,6 +23,48 @@ from model import ESMForAffinity
 logger = logging.getLogger(__name__)
 
 
+def _to_jsonable(value):
+    if isinstance(value, (np.generic,)):
+        return value.item()
+    if torch.is_tensor(value):
+        if value.numel() == 1:
+            return value.item()
+        return value.detach().cpu().tolist()
+    return value
+
+
+def save_scores_with_dataset(
+    scores: np.ndarray,
+    tokenized_dataset: Dataset,
+    raw_dataset: Optional[Dataset],
+    save_path: str,
+) -> None:
+    """
+    Save per-sample scores with dataset context as JSONL.
+    Each line contains tokenized index, raw index, score, and raw sample fields (if provided).
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, "w") as f:
+        for tokenized_idx, score in enumerate(scores):
+            row = tokenized_dataset[tokenized_idx]
+            raw_idx_value = row.get("raw_index", tokenized_idx)
+            raw_idx = int(raw_idx_value.item() if torch.is_tensor(raw_idx_value) else raw_idx_value)
+
+            record = {
+                "tokenized_index": int(tokenized_idx),
+                "raw_index": raw_idx,
+                "score": float(score),
+            }
+
+            if raw_dataset is not None and 0 <= raw_idx < len(raw_dataset):
+                raw_row = raw_dataset[raw_idx]
+                for k, v in raw_row.items():
+                    record[k] = _to_jsonable(v)
+
+            f.write(json.dumps(record) + "\n")
+
+
 def score_all_points(
     data_rater: ESMForAffinity,
     dataset: Dataset,
@@ -79,6 +121,7 @@ def compute_p_accept(
 def run_scoring_and_filtering(
     data_rater: ESMForAffinity,
     train_dataset: Dataset,
+    raw_train_dataset: Optional[Dataset] = None,
     N_ref: int = 10000,
     B: int = 64,
     keep_ratio: float = 0.7,
@@ -123,6 +166,13 @@ def run_scoring_and_filtering(
 
     # Save raw scores
     np.save(os.path.join(save_dir, "all_scores.npy"), all_scores)
+    scored_jsonl_path = os.path.join(save_dir, "all_scores_with_data.jsonl")
+    save_scores_with_dataset(
+        scores=all_scores,
+        tokenized_dataset=train_dataset,
+        raw_dataset=raw_train_dataset,
+        save_path=scored_jsonl_path,
+    )
 
     # ---- Phase 4: Filter using model.filter_dataset (UNCHANGED) ----
     logger.info("Running filter_dataset (model.py)...")
@@ -145,6 +195,7 @@ def run_scoring_and_filtering(
         "B": B,
         "N_ref": N_ref,
         "score_stats": score_stats,
+        "scores_with_data_path": scored_jsonl_path,
         "elapsed_seconds": elapsed,
     }
 
