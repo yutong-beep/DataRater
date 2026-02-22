@@ -4,19 +4,14 @@ main.py — Full DataRater Pipeline Entry Point
 ================================================
 
 Runs all 5 phases sequentially:
-  Phase 1: Baseline training (10 epochs, batch_size=64)
-  Phase 2: Meta-train DataRater
+  Phase 1: Baseline training 
+  Phase 2: Meta-train DataRater (Uses specialized meta_batch_size to prevent OOM)
   Phase 3: Score training data, build CDF
   Phase 4: Filter dataset using P_accept
   Phase 5: Retrain on curated data & compare
 
 Usage:
-    python main.py                          # Full pipeline, defaults
-    python main.py --phase 1               # Only Phase 1
-    python main.py --phase 2 --meta_steps 2000
-    python main.py --phase 1,2,3,4,5       # Explicit all phases
-    python main.py --ablation              # Run with first-order ablation
-    python main.py --sample_one_inner      # Sample 1 inner model per step
+    python main.py --epochs 10 --meta_steps 5000 --retrain_epochs 10 --batch_size 64 --meta_batch_size 16 --B 64
 """
 
 import os
@@ -49,7 +44,10 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
     p.add_argument("--max_length", type=int, default=512,
                    help="Max sequence length for tokenization")
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=64,
+                   help="Batch size for Baseline and Retrain (Phase 1 & 5)")
+    p.add_argument("--meta_batch_size", type=int, default=16,
+                   help="Smaller batch size specifically for DataRater Meta-Training to prevent OOM (Phase 2)")
     p.add_argument("--train_ratio", type=float, default=0.8)
 
     # Phase 1 & 5: Baseline training
@@ -73,7 +71,7 @@ def parse_args():
     p.add_argument("--N_ref", type=int, default=10000,
                    help="Number of reference points for CDF")
     p.add_argument("--B", type=int, default=64,
-                   help="Batch size B for P_accept formula")
+                   help="Batch size B used strictly for P_accept formula calculation")
     p.add_argument("--keep_ratio", type=float, default=0.7,
                    help="Target keep ratio for filtering")
 
@@ -158,7 +156,7 @@ def main():
     logger.info(f"Device: {device}")
 
     # ==========================================
-    # Data Preparation (shared across phases)
+    # Data Preparation (Shared across phases)
     # ==========================================
     logger.info("\n" + "=" * 50)
     logger.info("Preparing data...")
@@ -166,6 +164,7 @@ def main():
 
     from data_utils import prepare_data
 
+    # Uses the standard base batch_size (64)
     train_loader, val_loader, train_dataset, val_dataset = prepare_data(
         dataset_name=args.dataset,
         max_length=args.max_length,
@@ -181,7 +180,7 @@ def main():
     # ==========================================
     if 1 in phases:
         logger.info("\n" + "=" * 60)
-        logger.info("PHASE 1: Baseline Training (10 epochs)")
+        logger.info(f"PHASE 1: Baseline Training ({args.epochs} epochs)")
         logger.info("=" * 60)
 
         from baseline_trainer import train_baseline
@@ -224,11 +223,19 @@ def main():
         logger.info("=" * 60)
 
         from meta_trainer import run_meta_training
+        from data_utils import build_dataloaders
+        
+        # Build specialized dataloaders with smaller meta_batch_size to prevent OOM
+        logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
+        meta_train_loader, meta_val_loader = build_dataloaders(
+            train_dataset, val_dataset,
+            batch_size=args.meta_batch_size,
+        )
 
         phase2_dir = os.path.join(run_dir, "phase2_datarater")
         meta_result = run_meta_training(
-            train_loader=train_loader,
-            val_loader=val_loader,
+            train_loader=meta_train_loader,
+            val_loader=meta_val_loader,
             n_meta_steps=args.meta_steps,
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
@@ -299,12 +306,13 @@ def main():
     # ==========================================
     if 5 in phases and filtered_dataset is not None:
         logger.info("\n" + "=" * 60)
-        logger.info("PHASE 5: Retrain on DataRater-Curated Data")
+        logger.info(f"PHASE 5: Retrain on DataRater-Curated Data ({args.retrain_epochs} epochs)")
         logger.info("=" * 60)
 
         from data_utils import build_dataloaders
         from baseline_trainer import train_baseline
 
+        # Uses the standard base batch_size (64)
         filtered_loader, _ = build_dataloaders(
             filtered_dataset, val_dataset,
             batch_size=args.batch_size,
