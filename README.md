@@ -30,6 +30,9 @@ python main.py --batch_size 64 --meta_batch_size 16 --epochs 10 --meta_steps 500
 
 # Run with all source files (excluding Combined_train to avoid duplication)
 python main.py --data_mode all --output_dir experiments/mode_all
+
+# Run phase 2-5 with scale-robust outer objective
+python main.py --phase 2,3,4,5 --outer_objective mse_norm --data_mode all
 ```
 
 ## Running Individual Phases
@@ -89,8 +92,32 @@ python main.py --ablation --sample_one_inner
 | `--lifetime` | 2000 | Steps before inner model re-init |
 | `--T_window` | 2 | Truncated inner loop window |
 | `--temperature` | 0.5 | Softmax temperature `tau` for DataRater weighting |
+| `--outer_objective` | `mse_norm` | Outer loss type: `mse_norm`, `pearson`, `cosine`, or `mix` |
+| `--alpha` | 0.5 | Mixing weight for `mix` objective: `alpha*(1-pearson)+(1-alpha)*mse_norm` |
+| `--outer_eps` | 1e-8 | Epsilon for Pearson/Cosine stability |
+| `--mse_norm_eps` | 1e-6 | Epsilon for source-normalized MSE denominator |
 | `--B` | 64 | Batch size for P_accept formula |
 | `--keep_ratio` | 0.7 | Target dataset retention ratio |
+
+## Outer Objectives (Phase 2)
+
+- `mse_norm` (default): source-normalized MSE using source std from **train split only**
+- `pearson`: outer loss `1 - rho(pred, target)` (scale-invariant)
+- `cosine`: outer loss `1 - cosine(pred, target)` (mean-centered)
+- `mix`: `alpha*(1-rho) + (1-alpha)*mse_norm`
+
+### Experiment Commands
+
+```bash
+# 1) Source-normalized MSE
+python main.py --phase 2,3,4,5 --outer_objective mse_norm
+
+# 2) Pearson
+python main.py --phase 2,3,4,5 --outer_objective pearson
+
+# 3) Mixed objective
+python main.py --phase 2,3,4,5 --outer_objective mix --alpha 0.5
+```
 
 ## Data Modes
 
@@ -114,7 +141,7 @@ experiments/run_YYYYMMDD_HHMMSS/
 ├── phase34_scoring/
 │   ├── all_scores.npy             # Raw scores for all points
 │   ├── all_scores_with_data.jsonl # Score + mapped raw sample fields per row
-│   └── filter_stats.json          # Filtering statistics
+│   └── filter_stats.json          # Filtering statistics (includes kept_source_proportions)
 ├── phase5_retrained/
 │   ├── retrained_best.pt
 │   └── retrained_history.json

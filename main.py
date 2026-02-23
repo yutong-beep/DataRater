@@ -66,6 +66,15 @@ def parse_args():
                    help="Truncated inner loop window")
     p.add_argument("--temperature", type=float, default=0.5,
                    help="Softmax temperature tau used by DataRater in meta-training")
+    p.add_argument("--outer_objective", type=str, default="mse_norm",
+                   choices=["mse_norm", "pearson", "cosine", "mix"],
+                   help="Outer-loop objective for meta-training")
+    p.add_argument("--alpha", type=float, default=0.5,
+                   help="Mix coefficient for outer_objective='mix'")
+    p.add_argument("--outer_eps", type=float, default=1e-8,
+                   help="Numerical epsilon for pearson/cosine outer objectives")
+    p.add_argument("--mse_norm_eps", type=float, default=1e-6,
+                   help="Numerical epsilon for source-normalized MSE outer objective")
     p.add_argument("--ablation", action="store_true",
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
@@ -241,11 +250,17 @@ def main():
         meta_result = run_meta_training(
             train_loader=meta_train_loader,
             val_loader=meta_val_loader,
+            train_raw=train_raw_dataset,
+            val_raw=val_raw_dataset,
             n_meta_steps=args.meta_steps,
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
             T_window=args.T_window,
             temperature=args.temperature,
+            outer_objective=args.outer_objective,
+            alpha=args.alpha,
+            outer_eps=args.outer_eps,
+            mse_norm_eps=args.mse_norm_eps,
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
             save_dir=phase2_dir,

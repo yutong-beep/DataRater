@@ -1,5 +1,4 @@
 # model.py
-import math
 import random
 import logging
 from typing import Dict, List, Tuple, Optional
@@ -95,6 +94,110 @@ def _safe_mean(grads: List[Optional[torch.Tensor]], like: torch.Tensor) -> torch
     return torch.stack(valid, dim=0).mean(dim=0)
 
 
+def _pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
+    pred_c = pred - pred.mean()
+    target_c = target - target.mean()
+    denom = pred_c.norm(p=2) * target_c.norm(p=2) + eps
+    rho = torch.sum(pred_c * target_c) / denom
+    return 1.0 - rho
+
+
+def _cosine_loss(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
+    pred_c = pred - pred.mean()
+    target_c = target - target.mean()
+    denom = pred_c.norm(p=2) * target_c.norm(p=2) + eps
+    cos = torch.sum(pred_c * target_c) / denom
+    return 1.0 - cos
+
+
+def _build_source_std_stats(
+    train_raw,
+    clamp_min: float = 1e-3,
+) -> Tuple[Dict[str, float], float]:
+    src2vals: Dict[str, List[float]] = {}
+    all_vals: List[float] = []
+    has_source = "source" in train_raw.column_names
+    has_pkd = "pkd" in train_raw.column_names
+    if not has_pkd:
+        raise ValueError("train_raw must contain 'pkd' for source-normalized objectives.")
+
+    sources = train_raw["source"] if has_source else ["__global__"] * len(train_raw)
+    targets = train_raw["pkd"]
+
+    for src, y in zip(sources, targets):
+        try:
+            fy = float(y)
+        except (TypeError, ValueError):
+            continue
+        if not torch.isfinite(torch.tensor(fy)):
+            continue
+        key = str(src)
+        src2vals.setdefault(key, []).append(fy)
+        all_vals.append(fy)
+
+    if not all_vals:
+        global_std = 1.0
+        return {}, global_std
+
+    global_std = float(torch.tensor(all_vals, dtype=torch.float32).std(unbiased=False).item())
+    global_std = max(global_std, clamp_min)
+
+    src2std: Dict[str, float] = {}
+    for src, vals in src2vals.items():
+        if len(vals) < 2:
+            src_std = global_std
+        else:
+            src_std = float(torch.tensor(vals, dtype=torch.float32).std(unbiased=False).item())
+        src2std[src] = max(src_std, clamp_min)
+
+    return src2std, global_std
+
+
+def _lookup_batch_src_std(
+    raw_indices: torch.Tensor,
+    val_raw,
+    src2std: Dict[str, float],
+    global_std: float,
+    device: torch.device,
+) -> torch.Tensor:
+    vals: List[float] = []
+    n_val = len(val_raw)
+    has_source = "source" in val_raw.column_names
+    for idx in raw_indices.detach().cpu().tolist():
+        src_std = global_std
+        if 0 <= int(idx) < n_val and has_source:
+            src = str(val_raw[int(idx)]["source"])
+            src_std = src2std.get(src, global_std)
+        vals.append(float(src_std))
+    return torch.tensor(vals, dtype=torch.float32, device=device)
+
+
+def _compute_outer_loss(
+    objective: str,
+    preds: torch.Tensor,
+    targets: torch.Tensor,
+    src_std: Optional[torch.Tensor],
+    alpha: float,
+    outer_eps: float,
+    mse_norm_eps: float,
+) -> torch.Tensor:
+    if objective == "pearson":
+        return _pearson_loss(preds, targets, outer_eps)
+    if objective == "cosine":
+        return _cosine_loss(preds, targets, outer_eps)
+
+    if src_std is None:
+        src_std = torch.ones_like(targets)
+    mse_norm = torch.mean((preds - targets) ** 2 / (src_std ** 2 + mse_norm_eps))
+    if objective == "mse_norm":
+        return mse_norm
+    if objective == "mix":
+        pearson_term = _pearson_loss(preds, targets, outer_eps)
+        return alpha * pearson_term + (1.0 - alpha) * mse_norm
+
+    raise ValueError(f"Unsupported outer_objective: {objective}")
+
+
 def train_datarater(
     train_loader,
     val_loader,
@@ -106,6 +209,12 @@ def train_datarater(
     sample_one_inner: bool = False,
     inner_lr: float = 1e-4,
     tau: float = 0.5,
+    outer_objective: str = "mse_norm",
+    alpha: float = 0.5,
+    outer_eps: float = 1e-8,
+    mse_norm_eps: float = 1e-6,
+    train_raw=None,
+    val_raw=None,
     device: Optional[torch.device] = None,
     force_eager_attn: bool = False,  # set True if you still see SDPA issues
 ) -> ESMForAffinity:
@@ -123,6 +232,25 @@ def train_datarater(
     try:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        allowed_objectives = {"mse_norm", "pearson", "cosine", "mix"}
+        if outer_objective not in allowed_objectives:
+            raise ValueError(f"outer_objective must be one of {sorted(allowed_objectives)}")
+        if not (0.0 <= alpha <= 1.0):
+            raise ValueError("alpha must be in [0, 1].")
+
+        src2std: Dict[str, float] = {}
+        global_std = 1.0
+        if outer_objective in {"mse_norm", "mix"}:
+            if train_raw is None:
+                raise ValueError("train_raw is required for outer_objective in {'mse_norm', 'mix'}.")
+            if val_raw is None:
+                raise ValueError("val_raw is required for outer_objective in {'mse_norm', 'mix'}.")
+            src2std, global_std = _build_source_std_stats(train_raw, clamp_min=1e-3)
+            logger.info(
+                "[meta] source-std stats ready | num_sources=%d | global_std=%.6f",
+                len(src2std),
+                global_std,
+            )
 
         # DataRater (heavy)
         data_rater = ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
@@ -201,17 +329,32 @@ def train_datarater(
                 out_ids = x_out["input_ids"].to(device)
                 out_mask = x_out["attention_mask"].to(device)
                 out_targets = x_out["affinity"].to(device)
+                out_raw_index = x_out.get("raw_index")
+                if out_raw_index is not None:
+                    out_raw_index = out_raw_index.to(device)
 
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
-                outer_per = F.mse_loss(outer_preds, out_targets, reduction="none")
+                batch_src_std = None
+                if outer_objective in {"mse_norm", "mix"}:
+                    if out_raw_index is not None and val_raw is not None:
+                        batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
+                    else:
+                        batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
+                outer_loss = _compute_outer_loss(
+                    objective=outer_objective,
+                    preds=outer_preds,
+                    targets=out_targets,
+                    src_std=batch_src_std,
+                    alpha=alpha,
+                    outer_eps=outer_eps,
+                    mse_norm_eps=mse_norm_eps,
+                )
 
                 if use_first_order_ablation:
-                    # keep DataRater learnable even when not backprop through unrolled updates
+                    # Keep direct path to DataRater in first-order mode.
                     out_scores = data_rater(out_ids, out_mask)
                     out_w = F.softmax(out_scores / tau, dim=0)
-                    outer_loss = torch.sum(out_w * outer_per)
-                else:
-                    outer_loss = outer_per.mean()
+                    outer_loss = outer_loss + 0.01 * torch.sum(out_w * (outer_preds.detach() - out_targets).pow(2))
 
                 meta_grads = torch.autograd.grad(
                     outer_loss,
@@ -237,7 +380,14 @@ def train_datarater(
                     gsum = 0.0
                     for p in data_rater.parameters():
                         gsum += float(p.grad.norm().item()) if p.grad is not None else 0.0
-                logger.info(f"[meta] step {step+1}/{n_meta_steps} | grad_norm_sum={gsum:.4f}")
+                    outer_loss_value = float(outer_loss.detach().item())
+                    msg = (
+                        f"[meta] step {step+1}/{n_meta_steps} | obj={outer_objective} "
+                        f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f}"
+                    )
+                    if batch_src_std is not None:
+                        msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
+                logger.info(msg)
 
         return data_rater
 

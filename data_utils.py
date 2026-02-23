@@ -321,7 +321,10 @@ def build_dataloaders(
         input_ids = torch.stack([b["input_ids"] for b in batch])
         attention_mask = torch.stack([b["attention_mask"] for b in batch])
         affinity = torch.tensor([b["affinity"] for b in batch], dtype=torch.float32)
-        return {"input_ids": input_ids, "attention_mask": attention_mask, "affinity": affinity}
+        out = {"input_ids": input_ids, "attention_mask": attention_mask, "affinity": affinity}
+        if "raw_index" in batch[0]:
+            out["raw_index"] = torch.tensor([int(b["raw_index"]) for b in batch], dtype=torch.long)
+        return out
 
     train_loader = DataLoader(
         train_ds,

@@ -185,6 +185,19 @@ def run_scoring_and_filtering(
         keep_ratio=keep_ratio,
     )
 
+    kept_source_props = {}
+    if raw_train_dataset is not None and "raw_index" in filtered_dataset.column_names and "source" in raw_train_dataset.column_names:
+        kept_sources = []
+        for v in filtered_dataset["raw_index"]:
+            idx = int(v.item()) if torch.is_tensor(v) else int(v)
+            if 0 <= idx < len(raw_train_dataset):
+                kept_sources.append(str(raw_train_dataset[idx]["source"]))
+        if kept_sources:
+            unique, counts = np.unique(np.array(kept_sources), return_counts=True)
+            total = float(np.sum(counts))
+            kept_source_props = {str(u): float(c / total) for u, c in zip(unique, counts)}
+            logger.info("Kept source proportions: %s", json.dumps(kept_source_props, indent=2))
+
     elapsed = time.time() - t0
 
     stats = {
@@ -195,6 +208,7 @@ def run_scoring_and_filtering(
         "B": B,
         "N_ref": N_ref,
         "score_stats": score_stats,
+        "kept_source_proportions": kept_source_props,
         "scores_with_data_path": scored_jsonl_path,
         "elapsed_seconds": elapsed,
     }
