@@ -42,6 +42,8 @@ def parse_args():
 
     # Data
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
+    p.add_argument("--data_mode", type=str, default="combined_train", choices=["combined_train", "all"],
+                   help="Dataset loading mode: 'combined_train' (default) or 'all'")
     p.add_argument("--max_length", type=int, default=512,
                    help="Max sequence length for tokenization")
     p.add_argument("--batch_size", type=int, default=64,
@@ -173,6 +175,7 @@ def main():
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,
         seed=args.seed,
+        mode=args.data_mode,
     )
 
     results = {}  # Collect all results
