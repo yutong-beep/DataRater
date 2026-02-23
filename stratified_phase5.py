@@ -197,6 +197,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--train_ratio", type=float, default=0.8)
     ap.add_argument("--max_length", type=int, default=512)
+    ap.add_argument("--data_mode", type=str, default="combined_train", choices=["combined_train", "all"])
     ap.add_argument("--keep_ratios", type=str, default="0.7,0.8,0.9,0.95,1.0")
     ap.add_argument("--random_control_ratio", type=float, default=0.7)
     args = ap.parse_args()
@@ -218,15 +219,31 @@ def main():
         train_ratio=args.train_ratio,
         seed=args.seed,
         cache_dir=None,
-        mode="combined_train",
+        mode=args.data_mode,
     )
-    assert len(scores) == len(train_raw), (len(scores), len(train_raw))
 
     # tokenize once
     train_tok = tokenize_dataset(train_raw, max_length=args.max_length, model_name=ESM_MODEL_NAME)
     val_tok = tokenize_dataset(val_raw, max_length=args.max_length, model_name=ESM_MODEL_NAME)
 
-    sources = list(train_raw["source"])
+    # all_scores.npy is generated from the tokenized training dataset (not raw).
+    assert len(scores) == len(train_tok), (
+        f"Score length mismatch: scores={len(scores)} vs tokenized_train={len(train_tok)}. "
+        "Check seed/data_mode/max_length and make sure scores come from the same run."
+    )
+
+    raw_sources = list(train_raw["source"]) if "source" in train_raw.column_names else ["UNKNOWN"] * len(train_raw)
+    sources = []
+    if "raw_index" in train_tok.column_names:
+        for v in train_tok["raw_index"]:
+            idx = int(v.item()) if torch.is_tensor(v) else int(v)
+            if 0 <= idx < len(raw_sources):
+                sources.append(str(raw_sources[idx]))
+            else:
+                sources.append("UNKNOWN")
+    else:
+        # Fallback (older tokenized dataset schema): assume no rows were filtered.
+        sources = [str(x) for x in raw_sources[:len(train_tok)]]
 
     sweep_dir = os.path.join(run_dir, "phase5_sweep")
     os.makedirs(sweep_dir, exist_ok=True)

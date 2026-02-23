@@ -35,6 +35,8 @@ WHITELIST_FILES = [
     "SKEMPIv2.0.parquet",
 ]
 
+ALL_MODE_FILES = [f for f in WHITELIST_FILES if f != "Combined_train.parquet"]
+
 
 def _normalize_ppba_schema(df: pd.DataFrame, filename: str) -> pd.DataFrame:
     """
@@ -78,22 +80,22 @@ def download_and_split(
     train_ratio: float = 0.8,
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
-    mode: str = "combined_train",  # "combined_train" (recommended) or "all"
+    mode: str = "combined_train",  # "combined_train" or "all" (excluding Combined_train)
 ) -> Tuple[Dataset, Dataset]:
     """
     Strictly load dataset via hf_hub_download + pandas parquet reading,
     avoiding HF dataset config pitfalls completely.
 
     mode:
-      - "combined_train": only load Combined_train.parquet (recommended)
-      - "all": load and concat all WHITELIST_FILES
+      - "combined_train": only load Combined_train.parquet
+      - "all": load and concat all non-Combined parquet files
     """
     logger.info(f"Downloading dataset (strict whitelist): {dataset_name} | mode={mode}")
 
     if mode not in {"combined_train", "all"}:
         raise ValueError("mode must be 'combined_train' or 'all'")
 
-    files_to_load = ["Combined_train.parquet"] if mode == "combined_train" else list(WHITELIST_FILES)
+    files_to_load = ["Combined_train.parquet"] if mode == "combined_train" else list(ALL_MODE_FILES)
 
     dfs: List[pd.DataFrame] = []
     per_file_counts: Dict[str, int] = {}
