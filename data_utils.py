@@ -36,6 +36,40 @@ WHITELIST_FILES = [
 ]
 
 
+def _normalize_ppba_schema(df: pd.DataFrame, filename: str) -> pd.DataFrame:
+    """
+    Normalize mixed PPBA schemas to a unified set of columns for mode='all'.
+    """
+    df = df.copy()
+
+    # Unify target column
+    if "pkd" not in df.columns and "affinity(pKd)" in df.columns:
+        df["pkd"] = df["affinity(pKd)"]
+
+    # Unify sequence columns
+    if "protein1_sequence" not in df.columns and "protein_sequence_1" in df.columns:
+        df["protein1_sequence"] = df["protein_sequence_1"]
+    if "protein2_sequence" not in df.columns and "protein_sequence_2" in df.columns:
+        df["protein2_sequence"] = df["protein_sequence_2"]
+
+    # Ensure common analysis fields exist
+    if "source" not in df.columns:
+        df["source"] = filename.replace(".parquet", "")
+    if "pdb_id" not in df.columns:
+        df["pdb_id"] = pd.NA
+
+    # Keep only the unified core schema
+    keep = ["pdb_id", "pkd", "protein1_sequence", "protein2_sequence", "source"]
+    for col in keep:
+        if col not in df.columns:
+            df[col] = pd.NA
+    df = df[keep]
+
+    # Drop rows that cannot be used for training
+    df = df.dropna(subset=["pkd", "protein1_sequence", "protein2_sequence"])
+    return df
+
+
 # ==========================================
 # Download & Split (Strict Whitelist)
 # ==========================================
@@ -74,6 +108,8 @@ def download_and_split(
         )
         df = pd.read_parquet(local_path)
         df = df.dropna(how="all")
+        if mode == "all":
+            df = _normalize_ppba_schema(df, filename=fn)
         per_file_counts[fn] = len(df)
         dfs.append(df)
 
@@ -82,6 +118,14 @@ def download_and_split(
         logger.info(f"  - {k}: {v} rows")
 
     full_df = pd.concat(dfs, ignore_index=True)
+    if mode == "all":
+        logger.info(
+            "[mode=all] After schema normalize: rows=%d, cols=%s",
+            len(full_df),
+            list(full_df.columns),
+        )
+        logger.info("[mode=all] pkd missing rate: %.4f", float(full_df["pkd"].isna().mean()))
+
     full = Dataset.from_pandas(full_df, preserve_index=False)
 
     logger.info(f"Total samples before splitting: {len(full)}")
