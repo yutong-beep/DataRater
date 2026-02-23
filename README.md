@@ -26,7 +26,10 @@ pip install -r requirements.txt
 python main.py
 
 # With custom settings
-python main.py --batch_size 64 --epochs 10 --meta_steps 5000 --B 64
+python main.py --batch_size 64 --meta_batch_size 16 --epochs 10 --meta_steps 5000 --B 64 --temperature 0.5
+
+# Run with all source files (excluding Combined_train to avoid duplication)
+python main.py --data_mode all --output_dir experiments/mode_all
 ```
 
 ## Running Individual Phases
@@ -75,15 +78,24 @@ python main.py --ablation --sample_one_inner
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
+| `--output_dir` | `experiments` | Root directory for run outputs |
+| `--data_mode` | `combined_train` | `combined_train` or `all` (all non-Combined parquet files) |
 | `--batch_size` | 64 | Training batch size |
+| `--meta_batch_size` | 16 | Phase-2 meta-training batch size (separate from baseline/retrain batch size) |
 | `--max_length` | 512 | Max token sequence length |
 | `--epochs` | 10 | Baseline training epochs |
 | `--meta_steps` | 5000 | Meta-training steps |
 | `--n_inner_models` | 8 | Population of inner models |
 | `--lifetime` | 2000 | Steps before inner model re-init |
 | `--T_window` | 2 | Truncated inner loop window |
+| `--temperature` | 0.5 | Softmax temperature `tau` for DataRater weighting |
 | `--B` | 64 | Batch size for P_accept formula |
 | `--keep_ratio` | 0.7 | Target dataset retention ratio |
+
+## Data Modes
+
+- `combined_train` (default): uses only `Combined_train.parquet`
+- `all`: uses all whitelisted source files **except** `Combined_train.parquet`, with schema normalization in `data_utils.py`
 
 ## Output Structure
 
@@ -101,6 +113,7 @@ experiments/run_YYYYMMDD_HHMMSS/
 │   └── meta_config.json
 ├── phase34_scoring/
 │   ├── all_scores.npy             # Raw scores for all points
+│   ├── all_scores_with_data.jsonl # Score + mapped raw sample fields per row
 │   └── filter_stats.json          # Filtering statistics
 ├── phase5_retrained/
 │   ├── retrained_best.pt
