@@ -177,13 +177,17 @@ def run_scoring_and_filtering(
     # ---- Phase 4: Filter using model.filter_dataset (UNCHANGED) ----
     logger.info("Running filter_dataset (model.py)...")
     from model import filter_dataset
-    filtered_dataset = filter_dataset(
+    filtered_dataset, kept_indices = filter_dataset(
         data_rater=data_rater,
         original_dataset=train_dataset,
         N_ref=min(N_ref, len(train_dataset)),
         B=B,
         keep_ratio=keep_ratio,
+        return_indices=True,
     )
+    kept_indices_arr = np.array(kept_indices, dtype=np.int64)
+    kept_indices_path = os.path.join(save_dir, "kept_indices.npy")
+    np.save(kept_indices_path, kept_indices_arr)
 
     kept_source_props = {}
     if raw_train_dataset is not None and "raw_index" in filtered_dataset.column_names and "source" in raw_train_dataset.column_names:
@@ -209,6 +213,8 @@ def run_scoring_and_filtering(
         "N_ref": N_ref,
         "score_stats": score_stats,
         "kept_source_proportions": kept_source_props,
+        "keep_act": int(len(kept_indices_arr)),
+        "kept_indices_path": kept_indices_path,
         "scores_with_data_path": scored_jsonl_path,
         "elapsed_seconds": elapsed,
     }

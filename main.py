@@ -21,6 +21,7 @@ import time
 import logging
 import argparse
 from datetime import datetime
+from collections import Counter
 
 import torch
 import numpy as np
@@ -39,6 +40,10 @@ def parse_args():
                    help="Device (default: auto-detect)")
     p.add_argument("--output_dir", type=str, default="experiments",
                    help="Root output directory")
+    p.add_argument("--random_only", action="store_true",
+                   help="Run only random-baseline retrain for an existing run_dir, then exit")
+    p.add_argument("--run_dir", type=str, default=None,
+                   help="Existing run directory used by --random_only")
 
     # Data
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
@@ -91,12 +96,202 @@ def parse_args():
     # Phase 5: Retrain
     p.add_argument("--retrain_epochs", type=int, default=10,
                    help="Epochs for retraining on filtered data")
+    p.add_argument("--random_baseline", action="store_true",
+                   help="Also run matched random baseline retrain in Phase 5")
+    p.add_argument("--random_seed", type=int, default=42,
+                   help="Random seed for random baseline subset sampling")
+    p.add_argument("--random_mode", type=str, default="matched_source_counts",
+                   choices=["matched_source_counts", "stratified_ratio", "uniform"],
+                   help="Random baseline subset strategy")
 
     # Checkpoints (for resuming)
     p.add_argument("--datarater_ckpt", type=str, default=None,
                    help="Path to pre-trained DataRater checkpoint (skip Phase 2)")
 
     return p.parse_args()
+
+
+def _flag_set(flag: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
+
+
+def _resolve_param(name: str, cli_value, saved_cfg: dict, default):
+    flag = f"--{name}"
+    if _flag_set(flag):
+        return cli_value
+    return saved_cfg.get(name, default)
+
+
+def _extract_sources_for_tokenized(train_tok, train_raw):
+    raw_sources = list(train_raw["source"]) if "source" in train_raw.column_names else ["UNKNOWN"] * len(train_raw)
+    if "raw_index" not in train_tok.column_names:
+        return ["UNKNOWN"] * len(train_tok)
+    out = []
+    for v in train_tok["raw_index"]:
+        idx = int(v.item()) if torch.is_tensor(v) else int(v)
+        if 0 <= idx < len(raw_sources):
+            out.append(str(raw_sources[idx]))
+        else:
+            out.append("UNKNOWN")
+    return out
+
+
+def _sample_random_indices(
+    mode: str,
+    keep_act: int,
+    keep_ratio: float,
+    sources: list,
+    kept_indices: np.ndarray,
+    seed: int,
+):
+    rng = np.random.default_rng(seed)
+    n = len(sources)
+    all_idx = np.arange(n, dtype=np.int64)
+    src_arr = np.array(sources)
+
+    if keep_act > n:
+        raise ValueError(f"keep_act={keep_act} cannot exceed dataset size={n}")
+
+    if mode == "uniform":
+        out = rng.choice(all_idx, size=keep_act, replace=False)
+        return np.sort(out.astype(np.int64)), {"mode": mode}
+
+    if mode == "matched_source_counts":
+        kept_src = [sources[int(i)] for i in kept_indices.tolist()]
+        counts_kept = Counter(kept_src)
+        picked = []
+        for src, need in counts_kept.items():
+            cands = np.where(src_arr == src)[0]
+            if need > len(cands):
+                raise ValueError(f"Not enough candidates for source={src}: need {need}, have {len(cands)}")
+            chosen = rng.choice(cands, size=need, replace=False)
+            picked.extend(chosen.tolist())
+        out = np.array(sorted(picked), dtype=np.int64)
+        if len(out) != keep_act:
+            raise ValueError(f"Matched source counts produced {len(out)} != keep_act {keep_act}")
+        return out, {"mode": mode, "counts_kept": dict(counts_kept)}
+
+    # stratified_ratio
+    picked = []
+    unique_src = sorted(set(sources))
+    for i, src in enumerate(unique_src):
+        cands = np.where(src_arr == src)[0]
+        if i < len(unique_src) - 1:
+            k = int(round(keep_ratio * len(cands)))
+            k = min(k, len(cands))
+        else:
+            k = keep_act - len(picked)
+            k = max(0, min(k, len(cands)))
+        if k > 0:
+            chosen = rng.choice(cands, size=k, replace=False)
+            picked.extend(chosen.tolist())
+
+    if len(picked) < keep_act:
+        remaining = np.setdiff1d(all_idx, np.array(picked, dtype=np.int64), assume_unique=False)
+        add_k = keep_act - len(picked)
+        if add_k > 0:
+            picked.extend(rng.choice(remaining, size=add_k, replace=False).tolist())
+    elif len(picked) > keep_act:
+        picked = rng.choice(np.array(picked, dtype=np.int64), size=keep_act, replace=False).tolist()
+
+    out = np.array(sorted(picked), dtype=np.int64)
+    return out, {"mode": mode}
+
+
+def run_random_only(args):
+    if not args.run_dir:
+        raise ValueError("--run_dir is required when --random_only is set.")
+    run_dir = args.run_dir
+    cfg_path = os.path.join(run_dir, "config.json")
+    results_path = os.path.join(run_dir, "results.json")
+    if not os.path.exists(results_path):
+        raise FileNotFoundError(f"results.json not found: {results_path}")
+    saved_cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+    existing_results = json.load(open(results_path))
+
+    from data_utils import prepare_data
+    from baseline_trainer import train_baseline
+
+    dataset_name = _resolve_param("dataset", args.dataset, saved_cfg, "Bindwell/PPBA")
+    data_mode = _resolve_param("data_mode", args.data_mode, saved_cfg, "combined_train")
+    train_ratio = _resolve_param("train_ratio", args.train_ratio, saved_cfg, 0.8)
+    seed = _resolve_param("seed", args.seed, saved_cfg, 42)
+    max_length = _resolve_param("max_length", args.max_length, saved_cfg, 512)
+    batch_size = _resolve_param("batch_size", args.batch_size, saved_cfg, 64)
+    lr = _resolve_param("lr", args.lr, saved_cfg, 1e-4)
+    retrain_epochs = _resolve_param("retrain_epochs", args.retrain_epochs, saved_cfg, 10)
+
+    train_loader, val_loader, train_tok, val_tok, train_raw, val_raw = prepare_data(
+        dataset_name=dataset_name,
+        max_length=max_length,
+        batch_size=batch_size,
+        train_ratio=train_ratio,
+        seed=seed,
+        mode=data_mode,
+    )
+
+    kept_indices_path = os.path.join(run_dir, "phase34_scoring", "kept_indices.npy")
+    if not os.path.exists(kept_indices_path):
+        raise FileNotFoundError(f"kept indices not found: {kept_indices_path}")
+    kept_indices = np.load(kept_indices_path)
+    keep_act = int(len(kept_indices))
+    keep_ratio = float(existing_results.get("filtering", {}).get("target_keep_ratio", args.keep_ratio))
+
+    sources = _extract_sources_for_tokenized(train_tok, train_raw)
+    random_indices, extra_info = _sample_random_indices(
+        mode=args.random_mode,
+        keep_act=keep_act,
+        keep_ratio=keep_ratio,
+        sources=sources,
+        kept_indices=kept_indices,
+        seed=args.random_seed,
+    )
+
+    phase5_random_dir = os.path.join(run_dir, "phase5_random")
+    os.makedirs(phase5_random_dir, exist_ok=True)
+    np.save(os.path.join(phase5_random_dir, "random_kept_indices.npy"), random_indices)
+    random_info = {
+        "mode": args.random_mode,
+        "seed": int(args.random_seed),
+        "keep_act": keep_act,
+        "keep_ratio_target": keep_ratio,
+        **extra_info,
+    }
+    with open(os.path.join(phase5_random_dir, "random_info.json"), "w") as f:
+        json.dump(random_info, f, indent=2)
+
+    random_filtered = train_tok.select(random_indices.tolist())
+    random_result = train_baseline(
+        train_loader=torch.utils.data.DataLoader(
+            random_filtered, batch_size=batch_size, shuffle=True, num_workers=2,
+            collate_fn=lambda b: {
+                "input_ids": torch.stack([x["input_ids"] for x in b]),
+                "attention_mask": torch.stack([x["attention_mask"] for x in b]),
+                "affinity": torch.tensor([x["affinity"] for x in b], dtype=torch.float32),
+            },
+            drop_last=True, pin_memory=True
+        ),
+        val_loader=val_loader,
+        epochs=retrain_epochs,
+        lr=lr,
+        save_dir=phase5_random_dir,
+        tag="random",
+        device=torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    )
+
+    random_block = {
+        "mode": args.random_mode,
+        "seed": int(args.random_seed),
+        "keep_act": keep_act,
+        "metrics": random_result["best_metrics"],
+    }
+    with open(os.path.join(phase5_random_dir, "random_results.json"), "w") as f:
+        json.dump(random_block, f, indent=2)
+
+    existing_results["retrained_random"] = random_block
+    with open(results_path, "w") as f:
+        json.dump(existing_results, f, indent=2)
+    print(f"Random-only retrain complete. Updated: {results_path}")
 
 
 # ==========================================
@@ -132,6 +327,9 @@ def setup_logging(output_dir: str) -> logging.Logger:
 # ==========================================
 def main():
     args = parse_args()
+    if args.random_only:
+        run_random_only(args)
+        return
 
     # Parse phases
     phases = set(int(p.strip()) for p in args.phase.split(","))
@@ -357,6 +555,63 @@ def main():
             "history": retrained_result["history"],
             "filtered_train_size": len(filtered_dataset),
         }
+        results["retrained_datarater"] = {
+            "keep_ratio": float(args.keep_ratio),
+            "keep_act": int(len(filtered_dataset)),
+            "metrics": retrained_result["best_metrics"],
+        }
+
+        if args.random_baseline:
+            phase34_dir = os.path.join(run_dir, "phase34_scoring")
+            kept_indices_path = os.path.join(phase34_dir, "kept_indices.npy")
+            if not os.path.exists(kept_indices_path):
+                raise FileNotFoundError(f"Missing kept indices for random baseline: {kept_indices_path}")
+
+            kept_indices = np.load(kept_indices_path)
+            keep_act = int(len(kept_indices))
+            sources = _extract_sources_for_tokenized(train_dataset, train_raw_dataset)
+            random_indices, extra_info = _sample_random_indices(
+                mode=args.random_mode,
+                keep_act=keep_act,
+                keep_ratio=float(args.keep_ratio),
+                sources=sources,
+                kept_indices=kept_indices,
+                seed=args.random_seed,
+            )
+
+            random_kept_indices_path = os.path.join(phase34_dir, "random_kept_indices.npy")
+            np.save(random_kept_indices_path, random_indices)
+            random_info = {
+                "mode": args.random_mode,
+                "seed": int(args.random_seed),
+                "keep_act": keep_act,
+                "keep_ratio_target": float(args.keep_ratio),
+                **extra_info,
+            }
+            with open(os.path.join(phase34_dir, "random_info.json"), "w") as f:
+                json.dump(random_info, f, indent=2)
+
+            random_subset = train_dataset.select(random_indices.tolist())
+            random_loader, _ = build_dataloaders(
+                random_subset, val_dataset,
+                batch_size=args.batch_size,
+            )
+            phase5_random_dir = os.path.join(run_dir, "phase5_random")
+            random_result = train_baseline(
+                train_loader=random_loader,
+                val_loader=val_loader,
+                epochs=args.retrain_epochs,
+                lr=args.lr,
+                save_dir=phase5_random_dir,
+                tag="random",
+                device=device,
+            )
+            results["retrained_random"] = {
+                "mode": args.random_mode,
+                "seed": int(args.random_seed),
+                "keep_act": keep_act,
+                "metrics": random_result["best_metrics"],
+            }
 
         # Plot retraining curves
         from viz import plot_training_curves

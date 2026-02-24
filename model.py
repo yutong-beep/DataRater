@@ -399,7 +399,7 @@ def train_datarater(
 # =========================
 # 3) Filtering (non-differentiable by design)
 # =========================
-def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=0.7):
+def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=0.7, return_indices: bool = False):
     import bisect
     from scipy.stats import binom
 
@@ -439,4 +439,6 @@ def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=
 
     filtered_dataset = original_dataset.select(filtered_indices)
     print(f"Original size: {len(original_dataset)}, Filtered size: {len(filtered_dataset)}")
+    if return_indices:
+        return filtered_dataset, filtered_indices
     return filtered_dataset
