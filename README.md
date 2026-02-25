@@ -33,6 +33,12 @@ python main.py --data_mode all --output_dir experiments/mode_all
 
 # Run phase 2-5 with scale-robust outer objective
 python main.py --phase 2,3,4,5 --outer_objective mse_norm --data_mode all
+
+# Run phase 3-5 and include random baseline retrain in phase 5
+python main.py --phase 3,4,5 --datarater_ckpt path/to/datarater.pt --random_baseline --random_mode matched_source_counts --random_seed 42
+
+# Run random-only retrain for an existing run directory
+python main.py --random_only --run_dir experiments/run_YYYYMMDD_HHMMSS --random_mode matched_source_counts --random_seed 42
 ```
 
 ## Running Individual Phases
@@ -98,6 +104,18 @@ python main.py --ablation --sample_one_inner
 | `--mse_norm_eps` | 1e-6 | Epsilon for source-normalized MSE denominator |
 | `--B` | 64 | Batch size for P_accept formula |
 | `--keep_ratio` | 0.7 | Target dataset retention ratio |
+| `--retrain_epochs` | 10 | Epochs for retraining on filtered data |
+| `--random_baseline` | `False` | Also run random baseline retrain in Phase 5 |
+| `--random_seed` | 42 | Seed used for random subset sampling |
+| `--random_mode` | `matched_source_counts` | Random baseline strategy: `matched_source_counts`, `stratified_ratio`, `uniform` |
+| `--random_only` | `False` | Run only random baseline retrain for an existing run dir, then exit |
+| `--run_dir` | `None` | Existing run directory used by `--random_only` |
+
+## Random Baseline (`--random*`)
+
+- Integrated mode: add `--random_baseline` in normal pipeline runs; when Phase 5 executes, it retrains both DataRater subset and matched random subset (same `keep_act`).
+- Random-only mode: `--random_only --run_dir <existing_run>` loads prior run artifacts and executes only random baseline retrain.
+- Supported random subset strategies (`--random_mode`): `matched_source_counts` (default, match kept source counts), `stratified_ratio` (per-source ratio with exact-size adjustment), `uniform` (global random sample).
 
 ## Outer Objectives (Phase 2)
 
@@ -141,10 +159,18 @@ experiments/run_YYYYMMDD_HHMMSS/
 ├── phase34_scoring/
 │   ├── all_scores.npy             # Raw scores for all points
 │   ├── all_scores_with_data.jsonl # Score + mapped raw sample fields per row
-│   └── filter_stats.json          # Filtering statistics (includes kept_source_proportions)
+│   ├── filter_stats.json          # Filtering statistics (includes kept_source_proportions)
+│   ├── random_kept_indices.npy    # Random baseline subset indices (if --random_baseline)
+│   └── random_info.json           # Random subset metadata (mode/seed/keep_act, etc.)
 ├── phase5_retrained/
 │   ├── retrained_best.pt
 │   └── retrained_history.json
+├── phase5_random/                 # Present when --random_baseline or --random_only is used
+│   ├── random_best.pt
+│   ├── random_history.json
+│   ├── random_kept_indices.npy
+│   ├── random_info.json
+│   └── random_results.json
 └── plots/
     ├── phase1_curves.png          # Baseline training curves
     ├── phase5_curves.png          # Retrain training curves
