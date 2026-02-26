@@ -230,16 +230,27 @@ def run_random_only(args):
         mode=data_mode,
     )
 
-    kept_indices_path = os.path.join(run_dir, "phase34_scoring", "kept_indices.npy")
-    if not os.path.exists(kept_indices_path):
-        raise FileNotFoundError(f"kept indices not found: {kept_indices_path}")
-    kept_indices = np.load(kept_indices_path)
-    keep_act = int(len(kept_indices))
     keep_ratio = float(existing_results.get("filtering", {}).get("target_keep_ratio", args.keep_ratio))
+    kept_indices_path = os.path.join(run_dir, "phase34_scoring", "kept_indices.npy")
+    mode_used = args.random_mode
+    if os.path.exists(kept_indices_path):
+        kept_indices = np.load(kept_indices_path)
+        keep_act = int(len(kept_indices))
+    else:
+        n_train = len(train_tok)
+        keep_act = int(round(keep_ratio * n_train))
+        keep_act = max(1, min(keep_act, n_train))
+        kept_indices = np.array([], dtype=np.int64)
+        if mode_used == "matched_source_counts":
+            print(
+                f"[WARN] kept indices not found: {kept_indices_path}. "
+                "Fallback random_mode from 'matched_source_counts' to 'stratified_ratio'."
+            )
+            mode_used = "stratified_ratio"
 
     sources = _extract_sources_for_tokenized(train_tok, train_raw)
     random_indices, extra_info = _sample_random_indices(
-        mode=args.random_mode,
+        mode=mode_used,
         keep_act=keep_act,
         keep_ratio=keep_ratio,
         sources=sources,
@@ -247,11 +258,13 @@ def run_random_only(args):
         seed=args.random_seed,
     )
 
-    phase5_random_dir = os.path.join(run_dir, "phase5_random")
+    run_tag = f"{mode_used}_seed{int(args.random_seed)}"
+    phase5_random_dir = os.path.join(run_dir, f"phase5_random_{run_tag}")
     os.makedirs(phase5_random_dir, exist_ok=True)
     np.save(os.path.join(phase5_random_dir, "random_kept_indices.npy"), random_indices)
     random_info = {
-        "mode": args.random_mode,
+        "mode": mode_used,
+        "mode_requested": args.random_mode,
         "seed": int(args.random_seed),
         "keep_act": keep_act,
         "keep_ratio_target": keep_ratio,
@@ -280,7 +293,8 @@ def run_random_only(args):
     )
 
     random_block = {
-        "mode": args.random_mode,
+        "mode": mode_used,
+        "mode_requested": args.random_mode,
         "seed": int(args.random_seed),
         "keep_act": keep_act,
         "metrics": random_result["best_metrics"],
@@ -289,9 +303,15 @@ def run_random_only(args):
         json.dump(random_block, f, indent=2)
 
     existing_results["retrained_random"] = random_block
+    random_runs = existing_results.get("retrained_random_runs", {})
+    if not isinstance(random_runs, dict):
+        random_runs = {}
+    random_runs[run_tag] = random_block
+    existing_results["retrained_random_runs"] = random_runs
     with open(results_path, "w") as f:
         json.dump(existing_results, f, indent=2)
-    print(f"Random-only retrain complete. Updated: {results_path}")
+    print(f"Random-only retrain complete. Saved to: {phase5_random_dir}")
+    print(f"Updated: {results_path}")
 
 
 # ==========================================
