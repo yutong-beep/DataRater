@@ -2,10 +2,11 @@
 data/raw/
 data/processed/
 data/filtered/
-
+datarater_collect_*
 # Experiments
 experiments/
 
+tmp/
 # Python
 __pycache__/
 *.pyc
