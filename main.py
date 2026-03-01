@@ -68,11 +68,17 @@ def parse_args():
     p.add_argument("--lifetime", type=int, default=2000,
                    help="Inner model lifetime before re-init")
     p.add_argument("--T_window", type=int, default=2,
-                   help="Truncated inner loop window")
+                   help="Truncated inner loop window (paired with --T_backprop for v2 truncated BPTT)")
+    # v2 additions
+    p.add_argument("--T_backprop", type=int, default=2,
+                   help="Number of inner steps to backprop through (rest are detached warmup). "
+                        "Set < T_window to save memory with large T_window.")
+    p.add_argument("--use_zscore_inner", action="store_true",
+                   help="v2: Per-source z-score normalize inner targets to equalize source difficulty")
     p.add_argument("--temperature", type=float, default=0.5,
                    help="Softmax temperature tau used by DataRater in meta-training")
     p.add_argument("--outer_objective", type=str, default="mse_norm",
-                   choices=["mse_norm", "pearson", "cosine", "mix"],
+                   choices=["mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"],
                    help="Outer-loop objective for meta-training")
     p.add_argument("--alpha", type=float, default=0.5,
                    help="Mix coefficient for outer_objective='mix'")
@@ -474,6 +480,7 @@ def main():
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
             T_window=args.T_window,
+            T_backprop=args.T_backprop,
             temperature=args.temperature,
             outer_objective=args.outer_objective,
             alpha=args.alpha,
@@ -481,6 +488,7 @@ def main():
             mse_norm_eps=args.mse_norm_eps,
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
+            use_zscore_inner=args.use_zscore_inner,
             save_dir=phase2_dir,
         )
 

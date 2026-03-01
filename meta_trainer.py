@@ -31,6 +31,7 @@ def run_meta_training(
     n_inner_models: int = 8,
     lifetime: int = 2000,
     T_window: int = 2,
+    T_backprop: int = 2,
     temperature: float = 0.5,
     outer_objective: str = "mse_norm",
     alpha: float = 0.5,
@@ -38,6 +39,7 @@ def run_meta_training(
     mse_norm_eps: float = 1e-6,
     use_first_order_ablation: bool = False,
     sample_one_inner: bool = False,
+    use_zscore_inner: bool = False,
     save_dir: str = "checkpoints/datarater",
 ) -> Dict:
     """
@@ -56,6 +58,7 @@ def run_meta_training(
         "n_inner_models": n_inner_models,
         "lifetime": lifetime,
         "T_window": T_window,
+        "T_backprop": T_backprop,
         "temperature": temperature,
         "outer_objective": outer_objective,
         "alpha": alpha,
@@ -63,6 +66,7 @@ def run_meta_training(
         "mse_norm_eps": mse_norm_eps,
         "use_first_order_ablation": use_first_order_ablation,
         "sample_one_inner": sample_one_inner,
+        "use_zscore_inner": use_zscore_inner,
     }
 
     logger.info("=" * 60)
@@ -82,6 +86,7 @@ def run_meta_training(
         n_inner_models=n_inner_models,
         lifetime=lifetime,
         T_window=T_window,
+        T_backprop=T_backprop,
         tau=temperature,
         outer_objective=outer_objective,
         alpha=alpha,
@@ -91,6 +96,7 @@ def run_meta_training(
         val_raw=val_raw,
         use_first_order_ablation=use_first_order_ablation,
         sample_one_inner=sample_one_inner,
+        use_zscore_inner=use_zscore_inner,
     )
 
     elapsed = time.time() - t0

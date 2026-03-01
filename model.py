@@ -153,6 +153,76 @@ def _build_source_std_stats(
     return src2std, global_std
 
 
+# ---- v2: per-source z-score normalization stats ----
+def _build_source_zscore_stats(
+    raw_dataset,
+    clamp_min: float = 1e-3,
+) -> Tuple[Dict[str, Tuple[float, float]], float, float]:
+    """
+    Build per-source (mean, std) for z-score normalization of pkd targets.
+    Returns: (src2stats, global_mean, global_std)
+    """
+    src2vals: Dict[str, List[float]] = {}
+    all_vals: List[float] = []
+    has_source = "source" in raw_dataset.column_names
+    sources = raw_dataset["source"] if has_source else ["__global__"] * len(raw_dataset)
+    targets = raw_dataset["pkd"]
+
+    for src, y in zip(sources, targets):
+        try:
+            fy = float(y)
+        except (TypeError, ValueError):
+            continue
+        if not torch.isfinite(torch.tensor(fy)):
+            continue
+        src2vals.setdefault(str(src), []).append(fy)
+        all_vals.append(fy)
+
+    global_mean = float(torch.tensor(all_vals).mean().item()) if all_vals else 0.0
+    global_std = max(float(torch.tensor(all_vals).std(unbiased=False).item()), clamp_min) if all_vals else 1.0
+
+    src2stats: Dict[str, Tuple[float, float]] = {}
+    for src, vals in src2vals.items():
+        t = torch.tensor(vals)
+        m = float(t.mean().item())
+        s = max(float(t.std(unbiased=False).item()), clamp_min) if len(vals) >= 2 else global_std
+        src2stats[src] = (m, s)
+
+    return src2stats, global_mean, global_std
+
+
+def _zscore_normalize_targets(
+    targets: torch.Tensor,
+    raw_indices: torch.Tensor,
+    raw_dataset,
+    src2stats: Dict[str, Tuple[float, float]],
+    global_mean: float,
+    global_std: float,
+) -> torch.Tensor:
+    """
+    Apply per-source z-score: z = (pkd - src_mean) / src_std.
+    Used ONLY during Phase 2 inner loop.
+    """
+    device = targets.device
+    means = []
+    stds = []
+    n_raw = len(raw_dataset)
+    has_source = "source" in raw_dataset.column_names
+
+    for idx in raw_indices.detach().cpu().tolist():
+        if 0 <= int(idx) < n_raw and has_source:
+            src = str(raw_dataset[int(idx)]["source"])
+            m, s = src2stats.get(src, (global_mean, global_std))
+        else:
+            m, s = global_mean, global_std
+        means.append(m)
+        stds.append(s)
+
+    means_t = torch.tensor(means, dtype=torch.float32, device=device)
+    stds_t = torch.tensor(stds, dtype=torch.float32, device=device)
+    return (targets - means_t) / stds_t
+
+
 def _lookup_batch_src_std(
     raw_indices: torch.Tensor,
     val_raw,
@@ -180,11 +250,27 @@ def _compute_outer_loss(
     alpha: float,
     outer_eps: float,
     mse_norm_eps: float,
+    source_labels: Optional[List[str]] = None,
 ) -> torch.Tensor:
     if objective == "pearson":
         return _pearson_loss(preds, targets, outer_eps)
     if objective == "cosine":
         return _cosine_loss(preds, targets, outer_eps)
+
+    # ---- v2: source-stratified MSE ----
+    if objective == "source_stratified_mse":
+        if source_labels is None:
+            return F.mse_loss(preds, targets)
+        per_sample_mse = (preds - targets) ** 2
+        unique_sources = list(set(source_labels))
+        source_losses = []
+        for src in unique_sources:
+            mask = torch.tensor([s == src for s in source_labels], dtype=torch.bool, device=preds.device)
+            if mask.sum() > 0:
+                source_losses.append(per_sample_mse[mask].mean())
+        if not source_losses:
+            return F.mse_loss(preds, targets)
+        return torch.stack(source_losses).mean()
 
     if src_std is None:
         src_std = torch.ones_like(targets)
@@ -205,6 +291,7 @@ def train_datarater(
     n_inner_models: int = 8,
     lifetime: int = 2000,
     T_window: int = 2,
+    T_backprop: int = 2,
     use_first_order_ablation: bool = False,
     sample_one_inner: bool = False,
     inner_lr: float = 1e-4,
@@ -217,6 +304,7 @@ def train_datarater(
     val_raw=None,
     device: Optional[torch.device] = None,
     force_eager_attn: bool = False,  # set True if you still see SDPA issues
+    use_zscore_inner: bool = False,
 ) -> ESMForAffinity:
     """
     Meta-learn DataRater weights for samples.
@@ -232,11 +320,16 @@ def train_datarater(
     try:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        allowed_objectives = {"mse_norm", "pearson", "cosine", "mix"}
+        allowed_objectives = {"mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"}
         if outer_objective not in allowed_objectives:
             raise ValueError(f"outer_objective must be one of {sorted(allowed_objectives)}")
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be in [0, 1].")
+
+        # v2: clamp T_backprop
+        T_backprop_eff = min(T_backprop, T_window)
+        T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
+        logger.info(f"[meta-v2] T_window={T_window}, T_backprop={T_backprop_eff}, T_warmup={T_warmup}")
 
         src2std: Dict[str, float] = {}
         global_std = 1.0
@@ -251,6 +344,18 @@ def train_datarater(
                 len(src2std),
                 global_std,
             )
+
+        # v2: per-source z-score stats
+        src2zscore: Dict[str, Tuple[float, float]] = {}
+        zscore_global_mean, zscore_global_std = 0.0, 1.0
+        if use_zscore_inner and train_raw is not None:
+            src2zscore, zscore_global_mean, zscore_global_std = _build_source_zscore_stats(train_raw)
+            logger.info(
+                "[meta-v2] z-score stats ready | num_sources=%d | global_mean=%.4f | global_std=%.4f",
+                len(src2zscore), zscore_global_mean, zscore_global_std,
+            )
+            for src, (m, s) in src2zscore.items():
+                logger.info(f"  {src}: mean={m:.4f}, std={s:.4f}")
 
         # DataRater (heavy)
         data_rater = ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
@@ -285,7 +390,7 @@ def train_datarater(
                 inner_model = population[m_idx]
                 fast_weights = dict(inner_model.named_parameters())
 
-                # ---- inner loop ----
+                # ---- inner loop (v2: K-step truncated BPTT) ----
                 for _t in range(T_window):
                     try:
                         x_in = next(train_iter)
@@ -297,6 +402,17 @@ def train_datarater(
                     mask = x_in["attention_mask"].to(device)
                     targets = x_in["affinity"].to(device)
 
+                    # v2: per-source z-score normalization of inner targets
+                    if use_zscore_inner and src2zscore and "raw_index" in x_in:
+                        targets = _zscore_normalize_targets(
+                            targets, x_in["raw_index"].to(device),
+                            train_raw, src2zscore,
+                            zscore_global_mean, zscore_global_std,
+                        )
+
+                    # v2: only build graph for the last T_backprop steps
+                    is_graph_step = (_t >= T_warmup)
+
                     raw_scores = data_rater(input_ids, mask)      # [B]
                     weights = F.softmax(raw_scores / tau, dim=0)  # [B]
 
@@ -304,14 +420,15 @@ def train_datarater(
                     per = F.mse_loss(preds, targets, reduction="none")
                     inner_loss = torch.sum(weights * per)
 
+                    need_graph = is_graph_step and (not use_first_order_ablation)
                     grads = torch.autograd.grad(
                         inner_loss,
                         tuple(fast_weights.values()),
-                        create_graph=not use_first_order_ablation,
+                        create_graph=need_graph,
                         allow_unused=True,
                     )
 
-                    if use_first_order_ablation:
+                    if not need_graph:
                         grads = [g.detach() if g is not None else None for g in grads]
 
                     fast_weights = {
@@ -340,6 +457,19 @@ def train_datarater(
                         batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
                     else:
                         batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
+
+                # v2: get source labels for stratified outer loss
+                batch_source_labels = None
+                if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
+                    n_val = len(val_raw)
+                    has_src = "source" in val_raw.column_names
+                    batch_source_labels = []
+                    for idx in out_raw_index.detach().cpu().tolist():
+                        if 0 <= int(idx) < n_val and has_src:
+                            batch_source_labels.append(str(val_raw[int(idx)]["source"]))
+                        else:
+                            batch_source_labels.append("__unknown__")
+
                 outer_loss = _compute_outer_loss(
                     objective=outer_objective,
                     preds=outer_preds,
@@ -348,6 +478,7 @@ def train_datarater(
                     alpha=alpha,
                     outer_eps=outer_eps,
                     mse_norm_eps=mse_norm_eps,
+                    source_labels=batch_source_labels,
                 )
 
                 if use_first_order_ablation:
