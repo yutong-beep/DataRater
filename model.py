@@ -448,27 +448,6 @@ def train_datarater(
 
             rater_opt.zero_grad(set_to_none=True)
             meta_grads_accumulator = []
-            inner_batches = []
-            for _t in range(T_window):
-                try:
-                    x_in = next(train_iter)
-                except StopIteration:
-                    train_iter = iter(train_loader)
-                    x_in = next(train_iter)
-                inner_batches.append(x_in)
-
-            try:
-                x_out = next(val_iter)
-            except StopIteration:
-                val_iter = iter(val_loader)
-                x_out = next(val_iter)
-
-            out_ids_shared = x_out["input_ids"].to(device)
-            out_mask_shared = x_out["attention_mask"].to(device)
-            out_targets_shared = x_out["affinity"].to(device)
-            out_raw_index_shared = x_out.get("raw_index")
-            if out_raw_index_shared is not None:
-                out_raw_index_shared = out_raw_index_shared.to(device)
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
@@ -476,7 +455,11 @@ def train_datarater(
 
                 # ---- inner loop (v2: K-step truncated BPTT) ----
                 for _t in range(T_window):
-                    x_in = inner_batches[_t]
+                    try:
+                        x_in = next(train_iter)
+                    except StopIteration:
+                        train_iter = iter(train_loader)
+                        x_in = next(train_iter)
 
                     input_ids = x_in["input_ids"].to(device)
                     mask = x_in["attention_mask"].to(device)
@@ -524,10 +507,18 @@ def train_datarater(
                     }
 
                 # ---- outer loop ----
-                out_ids = out_ids_shared
-                out_mask = out_mask_shared
-                out_targets = out_targets_shared
-                out_raw_index = out_raw_index_shared
+                try:
+                    x_out = next(val_iter)
+                except StopIteration:
+                    val_iter = iter(val_loader)
+                    x_out = next(val_iter)
+
+                out_ids = x_out["input_ids"].to(device)
+                out_mask = x_out["attention_mask"].to(device)
+                out_targets = x_out["affinity"].to(device)
+                out_raw_index = x_out.get("raw_index")
+                if out_raw_index is not None:
+                    out_raw_index = out_raw_index.to(device)
 
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
                 batch_src_std = None
