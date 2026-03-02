@@ -90,10 +90,6 @@ def parse_args():
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
                    help="Sample 1 inner model per meta-step (Task f)")
-    p.add_argument("--meta_grad_clip", type=float, default=1.0,
-                   help="Max norm for meta-gradient clipping")
-    p.add_argument("--canary_interval", type=int, default=200,
-                   help="Run canary diagnostic probe every N meta-steps")
 
     # Phase 3-4: Scoring & filtering
     p.add_argument("--N_ref", type=int, default=10000,
@@ -493,9 +489,6 @@ def main():
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
             use_zscore_inner=args.use_zscore_inner,
-            meta_grad_clip=args.meta_grad_clip,
-            canary_interval=args.canary_interval,
-            train_dataset=train_dataset,
             save_dir=phase2_dir,
         )
 
