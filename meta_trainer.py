@@ -40,6 +40,9 @@ def run_meta_training(
     use_first_order_ablation: bool = False,
     sample_one_inner: bool = False,
     use_zscore_inner: bool = False,
+    meta_grad_clip: float = 1.0,
+    canary_interval: int = 200,
+    train_dataset=None,
     save_dir: str = "checkpoints/datarater",
 ) -> Dict:
     """
@@ -67,6 +70,8 @@ def run_meta_training(
         "use_first_order_ablation": use_first_order_ablation,
         "sample_one_inner": sample_one_inner,
         "use_zscore_inner": use_zscore_inner,
+        "meta_grad_clip": meta_grad_clip,
+        "canary_interval": canary_interval,
     }
 
     logger.info("=" * 60)
@@ -97,6 +102,9 @@ def run_meta_training(
         use_first_order_ablation=use_first_order_ablation,
         sample_one_inner=sample_one_inner,
         use_zscore_inner=use_zscore_inner,
+        meta_grad_clip=meta_grad_clip,
+        canary_interval=canary_interval,
+        train_dataset=train_dataset,
     )
 
     elapsed = time.time() - t0

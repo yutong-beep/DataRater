@@ -94,6 +94,63 @@ def _safe_mean(grads: List[Optional[torch.Tensor]], like: torch.Tensor) -> torch
     return torch.stack(valid, dim=0).mean(dim=0)
 
 
+def _canary_probe(
+    data_rater: nn.Module,
+    train_dataset,
+    train_raw,
+    n_probe: int = 500,
+    device: Optional[torch.device] = None,
+) -> dict:
+    """Score a random subset and compute diagnostic metrics."""
+    import random as _rnd
+    import numpy as _np
+    from scipy.stats import spearmanr as _sp
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data_rater.eval()
+    indices = _rnd.sample(range(len(train_dataset)), min(n_probe, len(train_dataset)))
+    scores: List[float] = []
+    pkds: List[float] = []
+    sources: List[str] = []
+
+    with torch.no_grad():
+        for idx in indices:
+            sample = train_dataset[idx]
+            ids = sample["input_ids"].unsqueeze(0).to(device)
+            mask = sample["attention_mask"].unsqueeze(0).to(device)
+            s = data_rater(ids, mask).item()
+            scores.append(float(s))
+            pkds.append(float(sample["affinity"]))
+
+            raw_v = sample.get("raw_index", -1)
+            raw_idx = int(raw_v.item()) if torch.is_tensor(raw_v) else int(raw_v)
+            if train_raw is not None and "source" in train_raw.column_names and 0 <= raw_idx < len(train_raw):
+                sources.append(str(train_raw[raw_idx]["source"]))
+            else:
+                sources.append("UNKNOWN")
+
+    data_rater.train()
+
+    scores_arr = _np.array(scores, dtype=float)
+    pkds_arr = _np.array(pkds, dtype=float)
+    sources_arr = _np.array(sources, dtype=object)
+
+    try:
+        global_spearman = float(_sp(scores_arr, pkds_arr).correlation)
+    except Exception:
+        global_spearman = float("nan")
+
+    source_iqrs: Dict[str, float] = {}
+    for src in _np.unique(sources_arr):
+        src_scores = scores_arr[sources_arr == src]
+        if len(src_scores) > 4:
+            source_iqrs[src] = float(_np.percentile(src_scores, 75) - _np.percentile(src_scores, 25))
+
+    return {"spearman": global_spearman, "source_iqrs": source_iqrs}
+
+
 def _pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
     pred_c = pred - pred.mean()
     target_c = target - target.mean()
@@ -305,6 +362,9 @@ def train_datarater(
     device: Optional[torch.device] = None,
     force_eager_attn: bool = False,  # set True if you still see SDPA issues
     use_zscore_inner: bool = False,
+    meta_grad_clip: float = 1.0,
+    train_dataset=None,
+    canary_interval: int = 200,
 ) -> ESMForAffinity:
     """
     Meta-learn DataRater weights for samples.
@@ -360,6 +420,9 @@ def train_datarater(
         # DataRater (heavy)
         data_rater = ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
         rater_opt = torch.optim.Adam(data_rater.parameters(), lr=1e-4)
+        rater_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            rater_opt, T_max=n_meta_steps, eta_min=1e-6
+        )
 
         # Inner population (heavy)
         population = [
@@ -385,6 +448,27 @@ def train_datarater(
 
             rater_opt.zero_grad(set_to_none=True)
             meta_grads_accumulator = []
+            inner_batches = []
+            for _t in range(T_window):
+                try:
+                    x_in = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(train_loader)
+                    x_in = next(train_iter)
+                inner_batches.append(x_in)
+
+            try:
+                x_out = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                x_out = next(val_iter)
+
+            out_ids_shared = x_out["input_ids"].to(device)
+            out_mask_shared = x_out["attention_mask"].to(device)
+            out_targets_shared = x_out["affinity"].to(device)
+            out_raw_index_shared = x_out.get("raw_index")
+            if out_raw_index_shared is not None:
+                out_raw_index_shared = out_raw_index_shared.to(device)
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
@@ -392,11 +476,7 @@ def train_datarater(
 
                 # ---- inner loop (v2: K-step truncated BPTT) ----
                 for _t in range(T_window):
-                    try:
-                        x_in = next(train_iter)
-                    except StopIteration:
-                        train_iter = iter(train_loader)
-                        x_in = next(train_iter)
+                    x_in = inner_batches[_t]
 
                     input_ids = x_in["input_ids"].to(device)
                     mask = x_in["attention_mask"].to(device)
@@ -410,11 +490,18 @@ def train_datarater(
                             zscore_global_mean, zscore_global_std,
                         )
 
+                    if _t == T_warmup:
+                        fast_weights = {
+                            k: v.detach().requires_grad_(True)
+                            for k, v in fast_weights.items()
+                        }
+
                     # v2: only build graph for the last T_backprop steps
                     is_graph_step = (_t >= T_warmup)
 
-                    raw_scores = data_rater(input_ids, mask)      # [B]
-                    weights = F.softmax(raw_scores / tau, dim=0)  # [B]
+                    with torch.set_grad_enabled(is_graph_step):
+                        raw_scores = data_rater(input_ids, mask)      # [B]
+                        weights = F.softmax(raw_scores / tau, dim=0)  # [B]
 
                     preds = functional_forward(inner_model, fast_weights, input_ids, mask)
                     per = F.mse_loss(preds, targets, reduction="none")
@@ -437,18 +524,10 @@ def train_datarater(
                     }
 
                 # ---- outer loop ----
-                try:
-                    x_out = next(val_iter)
-                except StopIteration:
-                    val_iter = iter(val_loader)
-                    x_out = next(val_iter)
-
-                out_ids = x_out["input_ids"].to(device)
-                out_mask = x_out["attention_mask"].to(device)
-                out_targets = x_out["affinity"].to(device)
-                out_raw_index = x_out.get("raw_index")
-                if out_raw_index is not None:
-                    out_raw_index = out_raw_index.to(device)
+                out_ids = out_ids_shared
+                out_mask = out_mask_shared
+                out_targets = out_targets_shared
+                out_raw_index = out_raw_index_shared
 
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
                 batch_src_std = None
@@ -504,7 +583,9 @@ def train_datarater(
             for p, grads_for_p in zip(params, zip(*meta_grads_accumulator)):
                 p.grad = _safe_mean(list(grads_for_p), p)
 
+            torch.nn.utils.clip_grad_norm_(data_rater.parameters(), max_norm=float(meta_grad_clip))
             rater_opt.step()
+            rater_scheduler.step()
 
             if (step + 1) % 50 == 0:
                 with torch.no_grad():
@@ -512,13 +593,29 @@ def train_datarater(
                     for p in data_rater.parameters():
                         gsum += float(p.grad.norm().item()) if p.grad is not None else 0.0
                     outer_loss_value = float(outer_loss.detach().item())
+                    current_lr = float(rater_scheduler.get_last_lr()[0])
                     msg = (
                         f"[meta] step {step+1}/{n_meta_steps} | obj={outer_objective} "
-                        f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f}"
+                        f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f} "
+                        f"| lr={current_lr:.2e}"
                     )
                     if batch_src_std is not None:
                         msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
                 logger.info(msg)
+
+            if train_dataset is not None and canary_interval > 0 and (step + 1) % canary_interval == 0:
+                canary = _canary_probe(data_rater, train_dataset, train_raw, n_probe=500, device=device)
+                canary_msg = f"[canary] step {step+1} | Spearman={canary['spearman']:.4f}"
+                for src, iqr_val in sorted(canary["source_iqrs"].items()):
+                    canary_msg += f" | {src}_IQR={iqr_val:.3f}"
+                logger.info(canary_msg)
+
+                pdz_iqr = canary["source_iqrs"].get("PDZ_PBM")
+                if pdz_iqr is not None and pdz_iqr < 1.0:
+                    logger.warning(
+                        f"[CANARY WARNING] step {step+1}: PDZ_PBM IQR={pdz_iqr:.4f}"
+                        f" < 1.0 -- DataRater may be collapsing!"
+                    )
 
         return data_rater
 
