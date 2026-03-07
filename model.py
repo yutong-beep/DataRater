@@ -1,7 +1,7 @@
 # model.py
 import random
 import logging
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -13,6 +13,14 @@ logger = logging.getLogger(__name__)
 
 ESM_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"
 ESM_HIDDEN = 320  # esm2_t6_8M hidden size
+DEFAULT_HARD_OUTER_SOURCES = ["SKEMPI v2.0", "PDBbind v2020"]
+
+
+def _mean_pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    mask = attention_mask.unsqueeze(-1).to(hidden.dtype)
+    summed = torch.sum(hidden * mask, dim=1)
+    denom = torch.clamp(mask.sum(dim=1), min=1e-9)
+    return summed / denom
 
 
 # =========================
@@ -51,15 +59,13 @@ class ESMForAffinity(nn.Module):
         if cache_init_state:
             self._init_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         out = self.esm(input_ids=input_ids, attention_mask=attention_mask)
         hidden = out.last_hidden_state  # [B, L, H]
+        return _mean_pool_hidden(hidden, attention_mask)
 
-        mask = attention_mask.unsqueeze(-1).to(hidden.dtype)  # [B, L, 1]
-        summed = torch.sum(hidden * mask, dim=1)
-        denom = torch.clamp(mask.sum(dim=1), min=1e-9)
-        pooled = summed / denom  # [B, H]
-
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        pooled = self.encode(input_ids, attention_mask)
         pred = self.mlp(pooled).squeeze(-1)  # [B]
         return pred
 
@@ -78,6 +84,278 @@ class ESMForAffinity(nn.Module):
 
     def get_trainable_params(self):
         return list(self.parameters())
+
+
+class MultiHeadDataRater(nn.Module):
+    """
+    Shared ESM2 trunk plus one score head per source.
+    """
+    def __init__(
+        self,
+        source_names: Sequence[str],
+        model_name: str = ESM_MODEL_NAME,
+        cache_init_state: bool = True,
+        force_eager_attn: bool = False,
+    ):
+        super().__init__()
+        self.model_name = model_name
+        self.force_eager_attn = force_eager_attn
+        self.source_names = [str(s) for s in source_names]
+        if not self.source_names:
+            raise ValueError("MultiHeadDataRater requires at least one source name.")
+
+        if force_eager_attn:
+            self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
+        else:
+            self.esm = EsmModel.from_pretrained(model_name)
+
+        self.heads = nn.ModuleDict({
+            src: nn.Sequential(
+                nn.Linear(ESM_HIDDEN, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1),
+            )
+            for src in self.source_names
+        })
+
+        self._init_state = None
+        if cache_init_state:
+            self._init_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+
+    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        out = self.esm(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = out.last_hidden_state
+        return _mean_pool_hidden(hidden, attention_mask)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, sources: Sequence[str]) -> torch.Tensor:
+        if len(sources) != int(input_ids.size(0)):
+            raise ValueError(f"Expected {input_ids.size(0)} sources, got {len(sources)}")
+
+        pooled = self.encode(input_ids, attention_mask)
+        scores = torch.empty(pooled.size(0), dtype=pooled.dtype, device=pooled.device)
+        grouped: Dict[str, List[int]] = {}
+        for idx, source_name in enumerate(sources):
+            source_key = str(source_name)
+            if source_key not in self.heads:
+                raise KeyError(f"Unknown source for MultiHeadDataRater: {source_key}")
+            grouped.setdefault(source_key, []).append(idx)
+
+        for source_key, idxs in grouped.items():
+            idx_t = torch.tensor(idxs, dtype=torch.long, device=pooled.device)
+            scores[idx_t] = self.heads[source_key](pooled[idx_t]).squeeze(-1)
+        return scores
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        if self._init_state is not None:
+            self.load_state_dict(self._init_state, strict=True)
+        else:
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    m.reset_parameters()
+
+    def get_trainable_params(self):
+        return list(self.parameters())
+
+
+def infer_source_names(*raw_datasets) -> List[str]:
+    names = set()
+    for raw_dataset in raw_datasets:
+        if raw_dataset is None or "source" not in getattr(raw_dataset, "column_names", []):
+            continue
+        for source_name in raw_dataset["source"]:
+            if source_name is None:
+                continue
+            source_str = str(source_name).strip()
+            if source_str:
+                names.add(source_str)
+    return sorted(names)
+
+
+def build_datarater_model(
+    arch: str = "single",
+    source_names: Optional[Sequence[str]] = None,
+    model_name: str = ESM_MODEL_NAME,
+    cache_init_state: bool = True,
+    force_eager_attn: bool = False,
+) -> nn.Module:
+    if arch == "single":
+        return ESMForAffinity(
+            model_name=model_name,
+            cache_init_state=cache_init_state,
+            force_eager_attn=force_eager_attn,
+        )
+    if arch == "multihead":
+        uniq_sources = []
+        for source_name in source_names or []:
+            source_str = str(source_name).strip()
+            if source_str and source_str not in uniq_sources:
+                uniq_sources.append(source_str)
+        if not uniq_sources:
+            raise ValueError("source_names are required when datarater_arch='multihead'.")
+        return MultiHeadDataRater(
+            source_names=uniq_sources,
+            model_name=model_name,
+            cache_init_state=cache_init_state,
+            force_eager_attn=force_eager_attn,
+        )
+    raise ValueError(f"Unsupported datarater arch: {arch}")
+
+
+def _normalize_source_name(name: str) -> str:
+    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+def _source_from_raw_index(raw_index: int, raw_dataset) -> str:
+    if raw_dataset is None or "source" not in getattr(raw_dataset, "column_names", []):
+        return "__unknown__"
+    if 0 <= int(raw_index) < len(raw_dataset):
+        return str(raw_dataset[int(raw_index)]["source"])
+    return "__unknown__"
+
+
+def _batch_sources_from_raw_indices(raw_indices, raw_dataset) -> List[str]:
+    if raw_indices is None:
+        raise ValueError("Multi-head DataRater requires raw_indices for source lookup.")
+    if torch.is_tensor(raw_indices):
+        if raw_indices.ndim == 0:
+            raw_idx_list = [int(raw_indices.item())]
+        else:
+            raw_idx_list = [int(v) for v in raw_indices.detach().cpu().tolist()]
+    elif isinstance(raw_indices, (list, tuple)):
+        raw_idx_list = [int(v) for v in raw_indices]
+    else:
+        raw_idx_list = [int(raw_indices)]
+
+    sources = [_source_from_raw_index(raw_idx, raw_dataset) for raw_idx in raw_idx_list]
+    if any(src == "__unknown__" for src in sources):
+        raise ValueError("Multi-head DataRater requires valid raw_index -> source mappings.")
+    return sources
+
+
+def datarater_forward(
+    data_rater: nn.Module,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    raw_indices=None,
+    raw_dataset=None,
+) -> torch.Tensor:
+    if isinstance(data_rater, MultiHeadDataRater):
+        batch_sources = _batch_sources_from_raw_indices(raw_indices, raw_dataset)
+        return data_rater(input_ids, attention_mask, batch_sources)
+    return data_rater(input_ids, attention_mask)
+
+
+def _resolve_requested_sources(requested: Sequence[str], available: Sequence[str]) -> Tuple[List[str], List[str]]:
+    norm_to_actual = {_normalize_source_name(src): str(src) for src in available}
+    resolved = []
+    missing = []
+    for source_name in requested:
+        actual = norm_to_actual.get(_normalize_source_name(source_name))
+        if actual is None:
+            missing.append(str(source_name))
+            continue
+        if actual not in resolved:
+            resolved.append(actual)
+    return resolved, missing
+
+
+def _build_outer_sampler(
+    val_loader,
+    val_raw,
+    outer_sampling: str,
+    outer_per_source: Optional[int],
+    hard_outer_sources: Optional[Sequence[str]],
+):
+    if outer_sampling == "random":
+        return None
+
+    dataset = getattr(val_loader, "dataset", None)
+    collate_fn = getattr(val_loader, "collate_fn", None)
+    if dataset is None or collate_fn is None:
+        raise ValueError("outer_sampling requires val_loader to expose dataset and collate_fn.")
+    if "raw_index" not in getattr(dataset, "column_names", []):
+        raise ValueError("outer_sampling requires val dataset batches to include raw_index.")
+    if val_raw is None or "source" not in getattr(val_raw, "column_names", []):
+        raise ValueError("outer_sampling requires val_raw with source labels.")
+
+    indices_by_source: Dict[str, List[int]] = {}
+    for tokenized_idx, raw_idx_value in enumerate(dataset["raw_index"]):
+        raw_idx = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
+        source_name = _source_from_raw_index(raw_idx, val_raw)
+        if source_name == "__unknown__":
+            continue
+        indices_by_source.setdefault(source_name, []).append(int(tokenized_idx))
+
+    available_sources = sorted(indices_by_source)
+    if not available_sources:
+        raise ValueError("No source-labeled validation samples available for outer_sampling.")
+
+    if outer_sampling == "balanced":
+        selected_sources = available_sources
+        missing_sources = []
+    elif outer_sampling == "harder":
+        requested_sources = list(hard_outer_sources) if hard_outer_sources else list(DEFAULT_HARD_OUTER_SOURCES)
+        selected_sources, missing_sources = _resolve_requested_sources(requested_sources, available_sources)
+        if not selected_sources:
+            raise ValueError(
+                f"outer_sampling='harder' found no matching sources. Requested={requested_sources}, "
+                f"available={available_sources}"
+            )
+    else:
+        raise ValueError(f"Unsupported outer_sampling mode: {outer_sampling}")
+
+    base_batch_size = int(getattr(val_loader, "batch_size", 1) or 1)
+    per_source = int(outer_per_source) if outer_per_source is not None else max(1, base_batch_size // max(1, len(selected_sources)))
+    if per_source <= 0:
+        raise ValueError("outer_per_source must be positive when provided.")
+
+    if missing_sources:
+        logger.warning(
+            "[meta] outer_sampling=%s missing requested sources: %s",
+            outer_sampling,
+            ", ".join(missing_sources),
+        )
+    logger.info(
+        "[meta] outer_sampling=%s | selected_sources=%s | outer_per_source=%d | outer_batch_size=%d",
+        outer_sampling,
+        selected_sources,
+        per_source,
+        per_source * len(selected_sources),
+    )
+
+    return {
+        "dataset": dataset,
+        "collate_fn": collate_fn,
+        "indices_by_source": indices_by_source,
+        "selected_sources": selected_sources,
+        "per_source": per_source,
+        "mode": outer_sampling,
+    }
+
+
+def _sample_outer_batch(outer_sampler):
+    if outer_sampler is None:
+        raise ValueError("outer_sampler must be initialized before sampling.")
+
+    sampled_indices: List[int] = []
+    per_source = int(outer_sampler["per_source"])
+    for source_name in outer_sampler["selected_sources"]:
+        candidates = outer_sampler["indices_by_source"][source_name]
+        if not candidates:
+            continue
+        if per_source <= len(candidates):
+            chosen = random.sample(candidates, per_source)
+        else:
+            chosen = random.choices(candidates, k=per_source)
+        sampled_indices.extend(int(idx) for idx in chosen)
+
+    if not sampled_indices:
+        raise RuntimeError("outer_sampling produced an empty outer batch.")
+
+    random.shuffle(sampled_indices)
+    samples = [outer_sampler["dataset"][idx] for idx in sampled_indices]
+    return outer_sampler["collate_fn"](samples)
 
 
 def functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], input_ids, attention_mask) -> torch.Tensor:
@@ -305,7 +583,11 @@ def train_datarater(
     device: Optional[torch.device] = None,
     force_eager_attn: bool = False,  # set True if you still see SDPA issues
     use_zscore_inner: bool = False,
-) -> ESMForAffinity:
+    datarater_arch: str = "single",
+    outer_sampling: str = "random",
+    outer_per_source: Optional[int] = None,
+    hard_outer_sources: Optional[Sequence[str]] = None,
+) -> nn.Module:
     """
     Meta-learn DataRater weights for samples.
 
@@ -325,11 +607,22 @@ def train_datarater(
             raise ValueError(f"outer_objective must be one of {sorted(allowed_objectives)}")
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be in [0, 1].")
+        if datarater_arch not in {"single", "multihead"}:
+            raise ValueError("datarater_arch must be one of {'single', 'multihead'}.")
+        if outer_sampling not in {"random", "balanced", "harder"}:
+            raise ValueError("outer_sampling must be one of {'random', 'balanced', 'harder'}.")
 
         # v2: clamp T_backprop
         T_backprop_eff = min(T_backprop, T_window)
         T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
-        logger.info(f"[meta-v2] T_window={T_window}, T_backprop={T_backprop_eff}, T_warmup={T_warmup}")
+        logger.info(
+            "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s",
+            T_window,
+            T_backprop_eff,
+            T_warmup,
+            datarater_arch,
+            outer_sampling,
+        )
 
         src2std: Dict[str, float] = {}
         global_std = 1.0
@@ -357,8 +650,17 @@ def train_datarater(
             for src, (m, s) in src2zscore.items():
                 logger.info(f"  {src}: mean={m:.4f}, std={s:.4f}")
 
+        source_names = infer_source_names(train_raw, val_raw)
+        if datarater_arch == "multihead":
+            logger.info("[meta] multi-head sources=%s", source_names)
+
         # DataRater (heavy)
-        data_rater = ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
+        data_rater = build_datarater_model(
+            arch=datarater_arch,
+            source_names=source_names,
+            cache_init_state=True,
+            force_eager_attn=force_eager_attn,
+        ).to(device)
         rater_opt = torch.optim.Adam(data_rater.parameters(), lr=1e-4)
 
         # Inner population (heavy)
@@ -369,6 +671,13 @@ def train_datarater(
 
         train_iter = iter(train_loader)
         val_iter = iter(val_loader)
+        outer_sampler = _build_outer_sampler(
+            val_loader=val_loader,
+            val_raw=val_raw,
+            outer_sampling=outer_sampling,
+            outer_per_source=outer_per_source,
+            hard_outer_sources=hard_outer_sources,
+        )
 
         data_rater.train()
 
@@ -413,7 +722,13 @@ def train_datarater(
                     # v2: only build graph for the last T_backprop steps
                     is_graph_step = (_t >= T_warmup)
 
-                    raw_scores = data_rater(input_ids, mask)      # [B]
+                    raw_scores = datarater_forward(
+                        data_rater,
+                        input_ids,
+                        mask,
+                        raw_indices=x_in.get("raw_index"),
+                        raw_dataset=train_raw,
+                    )      # [B]
                     weights = F.softmax(raw_scores / tau, dim=0)  # [B]
 
                     preds = functional_forward(inner_model, fast_weights, input_ids, mask)
@@ -437,11 +752,14 @@ def train_datarater(
                     }
 
                 # ---- outer loop ----
-                try:
-                    x_out = next(val_iter)
-                except StopIteration:
-                    val_iter = iter(val_loader)
-                    x_out = next(val_iter)
+                if outer_sampling == "random":
+                    try:
+                        x_out = next(val_iter)
+                    except StopIteration:
+                        val_iter = iter(val_loader)
+                        x_out = next(val_iter)
+                else:
+                    x_out = _sample_outer_batch(outer_sampler)
 
                 out_ids = x_out["input_ids"].to(device)
                 out_mask = x_out["attention_mask"].to(device)
@@ -483,7 +801,13 @@ def train_datarater(
 
                 if use_first_order_ablation:
                     # Keep direct path to DataRater in first-order mode.
-                    out_scores = data_rater(out_ids, out_mask)
+                    out_scores = datarater_forward(
+                        data_rater,
+                        out_ids,
+                        out_mask,
+                        raw_indices=out_raw_index,
+                        raw_dataset=val_raw,
+                    )
                     out_w = F.softmax(out_scores / tau, dim=0)
                     outer_loss = outer_loss + 0.01 * torch.sum(out_w * (outer_preds.detach() - out_targets).pow(2))
 
@@ -530,7 +854,15 @@ def train_datarater(
 # =========================
 # 3) Filtering (non-differentiable by design)
 # =========================
-def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=0.7, return_indices: bool = False):
+def filter_dataset(
+    data_rater,
+    original_dataset,
+    raw_dataset=None,
+    N_ref=10000,
+    B=256,
+    keep_ratio=0.7,
+    return_indices: bool = False,
+):
     import bisect
     from scipy.stats import binom
 
@@ -546,7 +878,18 @@ def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=
             sample = original_dataset[idx]
             input_ids = sample["input_ids"].unsqueeze(0).to(device)
             mask = sample["attention_mask"].unsqueeze(0).to(device)
-            score = data_rater(input_ids, mask).item()
+            raw_idx_value = sample.get("raw_index") if isinstance(sample, dict) else None
+            raw_idx = None
+            if raw_idx_value is not None:
+                raw_idx_int = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
+                raw_idx = torch.tensor([raw_idx_int], dtype=torch.long, device=device)
+            score = datarater_forward(
+                data_rater,
+                input_ids,
+                mask,
+                raw_indices=raw_idx,
+                raw_dataset=raw_dataset,
+            ).item()
             ref_scores.append(score)
 
     ref_scores.sort()
@@ -559,8 +902,19 @@ def filter_dataset(data_rater, original_dataset, N_ref=10000, B=256, keep_ratio=
             sample = original_dataset[idx]
             input_ids = sample["input_ids"].unsqueeze(0).to(device)
             mask = sample["attention_mask"].unsqueeze(0).to(device)
+            raw_idx_value = sample.get("raw_index") if isinstance(sample, dict) else None
+            raw_idx = None
+            if raw_idx_value is not None:
+                raw_idx_int = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
+                raw_idx = torch.tensor([raw_idx_int], dtype=torch.long, device=device)
 
-            score = data_rater(input_ids, mask).item()
+            score = datarater_forward(
+                data_rater,
+                input_ids,
+                mask,
+                raw_indices=raw_idx,
+                raw_dataset=raw_dataset,
+            ).item()
             pos = bisect.bisect_left(ref_scores, score)
             p = pos / max(1, len(ref_scores))
 

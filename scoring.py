@@ -18,7 +18,7 @@ from datasets import Dataset
 from scipy.stats import binom
 from tqdm import tqdm
 
-from model import ESMForAffinity
+from model import datarater_forward
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +66,9 @@ def save_scores_with_dataset(
 
 
 def score_all_points(
-    data_rater: ESMForAffinity,
+    data_rater,
     dataset: Dataset,
+    raw_dataset: Optional[Dataset] = None,
     device: Optional[torch.device] = None,
 ) -> np.ndarray:
     """
@@ -85,7 +86,15 @@ def score_all_points(
             sample = dataset[idx]
             input_ids = sample["input_ids"].unsqueeze(0).to(device)
             mask = sample["attention_mask"].unsqueeze(0).to(device)
-            score = data_rater(input_ids, mask).item()
+            raw_idx_value = sample.get("raw_index", idx)
+            raw_idx = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
+            score = datarater_forward(
+                data_rater,
+                input_ids,
+                mask,
+                raw_indices=torch.tensor([raw_idx], dtype=torch.long, device=device),
+                raw_dataset=raw_dataset,
+            ).item()
             scores.append(score)
 
     return np.array(scores)
@@ -119,7 +128,7 @@ def compute_p_accept(
 
 
 def run_scoring_and_filtering(
-    data_rater: ESMForAffinity,
+    data_rater,
     train_dataset: Dataset,
     raw_train_dataset: Optional[Dataset] = None,
     N_ref: int = 10000,
@@ -151,7 +160,7 @@ def run_scoring_and_filtering(
 
     # ---- Phase 3: Score all points for analytics ----
     logger.info("Scoring all training points for analytics...")
-    all_scores = score_all_points(data_rater, train_dataset, device)
+    all_scores = score_all_points(data_rater, train_dataset, raw_train_dataset, device)
 
     score_stats = {
         "mean": float(np.mean(all_scores)),
@@ -180,6 +189,7 @@ def run_scoring_and_filtering(
     filtered_dataset, kept_indices = filter_dataset(
         data_rater=data_rater,
         original_dataset=train_dataset,
+        raw_dataset=raw_train_dataset,
         N_ref=min(N_ref, len(train_dataset)),
         B=B,
         keep_ratio=keep_ratio,

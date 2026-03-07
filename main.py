@@ -90,6 +90,16 @@ def parse_args():
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
                    help="Sample 1 inner model per meta-step (Task f)")
+    p.add_argument("--datarater_arch", type=str, default="single",
+                   choices=["single", "multihead"],
+                   help="DataRater architecture for Phase 2")
+    p.add_argument("--outer_sampling", type=str, default="random",
+                   choices=["random", "balanced", "harder"],
+                   help="Outer-batch sampling mode for Phase 2")
+    p.add_argument("--outer_per_source", type=int, default=None,
+                   help="Samples per source in each balanced/harder outer batch (default: auto)")
+    p.add_argument("--hard_outer_sources", type=str, default="SKEMPI v2.0,PDBbind v2020",
+                   help="Comma-separated source names used when --outer_sampling harder")
 
     # Phase 3-4: Scoring & filtering
     p.add_argument("--N_ref", type=int, default=10000,
@@ -126,6 +136,12 @@ def _resolve_param(name: str, cli_value, saved_cfg: dict, default):
     if _flag_set(flag):
         return cli_value
     return saved_cfg.get(name, default)
+
+
+def _parse_csv_arg(csv_arg: str) -> list:
+    if csv_arg is None:
+        return []
+    return [part.strip() for part in str(csv_arg).split(",") if part.strip()]
 
 
 def _extract_sources_for_tokenized(train_tok, train_raw):
@@ -362,7 +378,8 @@ def main():
 
     # Output dir with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+    run_prefix = f"p2_{args.datarater_arch}_{args.outer_sampling}outer"
+    run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
     logger = setup_logging(run_dir)
@@ -462,6 +479,7 @@ def main():
 
         from meta_trainer import run_meta_training
         from data_utils import build_dataloaders
+        hard_outer_sources = _parse_csv_arg(args.hard_outer_sources)
         
         # Build specialized dataloaders with smaller meta_batch_size to prevent OOM
         logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
@@ -489,6 +507,10 @@ def main():
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
             use_zscore_inner=args.use_zscore_inner,
+            datarater_arch=args.datarater_arch,
+            outer_sampling=args.outer_sampling,
+            outer_per_source=args.outer_per_source,
+            hard_outer_sources=hard_outer_sources,
             save_dir=phase2_dir,
         )
 
@@ -503,8 +525,12 @@ def main():
     # Load DataRater from checkpoint if Phase 2 was skipped
     if data_rater is None and args.datarater_ckpt:
         logger.info(f"Loading DataRater from checkpoint: {args.datarater_ckpt}")
-        from model import ESMForAffinity
-        data_rater = ESMForAffinity().to(device)
+        from model import build_datarater_model, infer_source_names
+        source_names = infer_source_names(train_raw_dataset, val_raw_dataset)
+        data_rater = build_datarater_model(
+            arch=args.datarater_arch,
+            source_names=source_names,
+        ).to(device)
         data_rater.load_state_dict(torch.load(args.datarater_ckpt, map_location=device, weights_only=True))
 
     # ==========================================

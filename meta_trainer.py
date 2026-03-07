@@ -12,7 +12,7 @@ import os
 import json
 import time
 import logging
-from typing import Dict, Optional
+from typing import Dict, Optional, Sequence
 
 import torch
 from torch.utils.data import DataLoader
@@ -40,6 +40,10 @@ def run_meta_training(
     use_first_order_ablation: bool = False,
     sample_one_inner: bool = False,
     use_zscore_inner: bool = False,
+    datarater_arch: str = "single",
+    outer_sampling: str = "random",
+    outer_per_source: Optional[int] = None,
+    hard_outer_sources: Optional[Sequence[str]] = None,
     save_dir: str = "checkpoints/datarater",
 ) -> Dict:
     """
@@ -67,6 +71,10 @@ def run_meta_training(
         "use_first_order_ablation": use_first_order_ablation,
         "sample_one_inner": sample_one_inner,
         "use_zscore_inner": use_zscore_inner,
+        "datarater_arch": datarater_arch,
+        "outer_sampling": outer_sampling,
+        "outer_per_source": outer_per_source,
+        "hard_outer_sources": list(hard_outer_sources) if hard_outer_sources is not None else None,
     }
 
     logger.info("=" * 60)
@@ -97,6 +105,10 @@ def run_meta_training(
         use_first_order_ablation=use_first_order_ablation,
         sample_one_inner=sample_one_inner,
         use_zscore_inner=use_zscore_inner,
+        datarater_arch=datarater_arch,
+        outer_sampling=outer_sampling,
+        outer_per_source=outer_per_source,
+        hard_outer_sources=hard_outer_sources,
     )
 
     elapsed = time.time() - t0
