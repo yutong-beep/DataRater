@@ -91,7 +91,7 @@ def parse_args():
     p.add_argument("--sample_one_inner", action="store_true",
                    help="Sample 1 inner model per meta-step (Task f)")
     p.add_argument("--datarater_arch", type=str, default="single",
-                   choices=["single", "multihead"],
+                   choices=["single", "multihead", "moe"],
                    help="DataRater architecture for Phase 2")
     p.add_argument("--outer_sampling", type=str, default="random",
                    choices=["random", "balanced", "harder"],
@@ -100,6 +100,25 @@ def parse_args():
                    help="Samples per source in each balanced/harder outer batch (default: auto)")
     p.add_argument("--hard_outer_sources", type=str, default="SKEMPI v2.0,PDBbind v2020",
                    help="Comma-separated source names used when --outer_sampling harder")
+    p.add_argument("--num_experts", type=int, default=4,
+                   help="Number of experts when --datarater_arch moe")
+    p.add_argument("--router_top_k", type=int, default=2, choices=[1, 2],
+                   help="Sparse router top-k for MoE DataRater")
+    p.add_argument("--capacity_factor", type=float, default=1.25,
+                   help="Capacity multiplier used by MoE expert dispatch")
+    p.add_argument("--router_aux_loss_coef", type=float, default=0.01,
+                   help="Coefficient for MoE router load-balancing auxiliary loss")
+    p.add_argument("--router_z_loss_coef", type=float, default=0.0,
+                   help="Coefficient for MoE router z-loss regularization")
+    p.add_argument("--router_noise_std", type=float, default=0.0,
+                   help="Gaussian jitter std added to MoE router logits during training")
+    p.add_argument("--router_temperature", type=float, default=1.0,
+                   help="Temperature applied to MoE router logits before softmax")
+    p.add_argument("--moe_score_merge", type=str, default="weighted_sum",
+                   choices=["weighted_sum", "top1_only"],
+                   help="How to merge MoE expert scores back to a scalar")
+    p.add_argument("--drop_overflow_tokens", action=argparse.BooleanOptionalAction, default=True,
+                   help="Whether MoE should drop overflowed expert assignments")
 
     # Phase 3-4: Scoring & filtering
     p.add_argument("--N_ref", type=int, default=10000,
@@ -511,6 +530,15 @@ def main():
             outer_sampling=args.outer_sampling,
             outer_per_source=args.outer_per_source,
             hard_outer_sources=hard_outer_sources,
+            num_experts=args.num_experts,
+            router_top_k=args.router_top_k,
+            capacity_factor=args.capacity_factor,
+            router_aux_loss_coef=args.router_aux_loss_coef,
+            router_z_loss_coef=args.router_z_loss_coef,
+            router_noise_std=args.router_noise_std,
+            router_temperature=args.router_temperature,
+            moe_score_merge=args.moe_score_merge,
+            drop_overflow_tokens=args.drop_overflow_tokens,
             save_dir=phase2_dir,
         )
 
@@ -530,6 +558,13 @@ def main():
         data_rater = build_datarater_model(
             arch=args.datarater_arch,
             source_names=source_names,
+            num_experts=args.num_experts,
+            router_top_k=args.router_top_k,
+            capacity_factor=args.capacity_factor,
+            router_temperature=args.router_temperature,
+            router_noise_std=args.router_noise_std,
+            moe_score_merge=args.moe_score_merge,
+            drop_overflow_tokens=args.drop_overflow_tokens,
         ).to(device)
         data_rater.load_state_dict(torch.load(args.datarater_ckpt, map_location=device, weights_only=True))
 

@@ -44,6 +44,15 @@ def run_meta_training(
     outer_sampling: str = "random",
     outer_per_source: Optional[int] = None,
     hard_outer_sources: Optional[Sequence[str]] = None,
+    num_experts: int = 4,
+    router_top_k: int = 2,
+    capacity_factor: float = 1.25,
+    router_aux_loss_coef: float = 0.01,
+    router_z_loss_coef: float = 0.0,
+    router_noise_std: float = 0.0,
+    router_temperature: float = 1.0,
+    moe_score_merge: str = "weighted_sum",
+    drop_overflow_tokens: bool = True,
     save_dir: str = "checkpoints/datarater",
 ) -> Dict:
     """
@@ -75,6 +84,15 @@ def run_meta_training(
         "outer_sampling": outer_sampling,
         "outer_per_source": outer_per_source,
         "hard_outer_sources": list(hard_outer_sources) if hard_outer_sources is not None else None,
+        "num_experts": num_experts,
+        "router_top_k": router_top_k,
+        "capacity_factor": capacity_factor,
+        "router_aux_loss_coef": router_aux_loss_coef,
+        "router_z_loss_coef": router_z_loss_coef,
+        "router_noise_std": router_noise_std,
+        "router_temperature": router_temperature,
+        "moe_score_merge": moe_score_merge,
+        "drop_overflow_tokens": drop_overflow_tokens,
     }
 
     logger.info("=" * 60)
@@ -109,6 +127,15 @@ def run_meta_training(
         outer_sampling=outer_sampling,
         outer_per_source=outer_per_source,
         hard_outer_sources=hard_outer_sources,
+        num_experts=num_experts,
+        router_top_k=router_top_k,
+        capacity_factor=capacity_factor,
+        router_aux_loss_coef=router_aux_loss_coef,
+        router_z_loss_coef=router_z_loss_coef,
+        router_noise_std=router_noise_std,
+        router_temperature=router_temperature,
+        moe_score_merge=moe_score_merge,
+        drop_overflow_tokens=drop_overflow_tokens,
     )
 
     elapsed = time.time() - t0

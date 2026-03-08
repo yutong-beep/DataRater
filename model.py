@@ -1,4 +1,5 @@
 # model.py
+import math
 import random
 import logging
 from typing import Dict, List, Tuple, Optional, Sequence
@@ -158,6 +159,217 @@ class MultiHeadDataRater(nn.Module):
         return list(self.parameters())
 
 
+class MoEDataRater(nn.Module):
+    """
+    Learned sparse Mixture-of-Experts scorer for Phase-2 DataRater.
+    """
+    def __init__(
+        self,
+        model_name: str = ESM_MODEL_NAME,
+        num_experts: int = 4,
+        router_top_k: int = 2,
+        capacity_factor: float = 1.25,
+        router_temperature: float = 1.0,
+        router_noise_std: float = 0.0,
+        moe_score_merge: str = "weighted_sum",
+        drop_overflow_tokens: bool = True,
+        cache_init_state: bool = True,
+        force_eager_attn: bool = False,
+    ):
+        super().__init__()
+        if num_experts <= 0:
+            raise ValueError("num_experts must be positive.")
+        if router_top_k not in {1, 2}:
+            raise ValueError("router_top_k must be 1 or 2.")
+        if router_top_k > num_experts:
+            raise ValueError("router_top_k cannot exceed num_experts.")
+        if capacity_factor <= 0.0:
+            raise ValueError("capacity_factor must be positive.")
+        if router_temperature <= 0.0:
+            raise ValueError("router_temperature must be positive.")
+        if moe_score_merge not in {"weighted_sum", "top1_only"}:
+            raise ValueError("moe_score_merge must be one of {'weighted_sum', 'top1_only'}.")
+
+        self.model_name = model_name
+        self.force_eager_attn = force_eager_attn
+        self.num_experts = int(num_experts)
+        self.router_top_k = int(router_top_k)
+        self.capacity_factor = float(capacity_factor)
+        self.router_temperature = float(router_temperature)
+        self.router_noise_std = float(router_noise_std)
+        self.moe_score_merge = str(moe_score_merge)
+        self.drop_overflow_tokens = bool(drop_overflow_tokens)
+
+        if force_eager_attn:
+            self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
+        else:
+            self.esm = EsmModel.from_pretrained(model_name)
+
+        self.router = nn.Linear(ESM_HIDDEN, self.num_experts)
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(ESM_HIDDEN, 128),
+                nn.ReLU(),
+                nn.Linear(128, 1),
+            )
+            for _ in range(self.num_experts)
+        ])
+
+        self._init_state = None
+        if cache_init_state:
+            self._init_state = {k: v.detach().cpu().clone() for k, v in self.state_dict().items()}
+
+    def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        out = self.esm(input_ids=input_ids, attention_mask=attention_mask)
+        hidden = out.last_hidden_state
+        return _mean_pool_hidden(hidden, attention_mask)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        return_router_info: bool = False,
+    ):
+        pooled = self.encode(input_ids, attention_mask)
+        batch_size = int(pooled.size(0))
+        device = pooled.device
+        dtype = pooled.dtype
+
+        router_logits = self.router(pooled) / self.router_temperature
+        if self.training and self.router_noise_std > 0.0:
+            router_logits = router_logits + torch.randn_like(router_logits) * self.router_noise_std
+
+        router_probs = F.softmax(router_logits, dim=-1)
+        topk_vals, topk_idx = torch.topk(router_probs, k=self.router_top_k, dim=-1)
+        topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+
+        capacity = max(1, int(math.ceil(self.capacity_factor * batch_size * self.router_top_k / self.num_experts)))
+        accepted_mask = torch.zeros((batch_size, self.router_top_k), dtype=torch.bool, device=device)
+        route_scores = torch.zeros((batch_size, self.router_top_k), dtype=dtype, device=device)
+        expert_counts = torch.zeros(self.num_experts, dtype=torch.long, device=device)
+        overflow_count = torch.tensor(0, dtype=torch.long, device=device)
+
+        assignments = []
+        for token_idx in range(batch_size):
+            for route_pos in range(self.router_top_k):
+                assignments.append(
+                    (
+                        float(topk_vals[token_idx, route_pos].detach().item()),
+                        int(token_idx),
+                        int(route_pos),
+                        int(topk_idx[token_idx, route_pos].item()),
+                    )
+                )
+        assignments.sort(key=lambda item: item[0], reverse=True)
+
+        assignments_by_expert: Dict[int, List[Tuple[int, int]]] = {e: [] for e in range(self.num_experts)}
+        for _, token_idx, route_pos, expert_idx in assignments:
+            expert_is_full = int(expert_counts[expert_idx].item()) >= capacity
+            if expert_is_full:
+                overflow_count = overflow_count + 1
+                continue
+
+            expert_counts[expert_idx] = expert_counts[expert_idx] + 1
+            accepted_mask[token_idx, route_pos] = True
+            assignments_by_expert[expert_idx].append((token_idx, route_pos))
+
+        for expert_idx, expert_assignments in assignments_by_expert.items():
+            if not expert_assignments:
+                continue
+            token_indices = torch.tensor([token_idx for token_idx, _ in expert_assignments], dtype=torch.long, device=device)
+            route_positions = torch.tensor([route_pos for _, route_pos in expert_assignments], dtype=torch.long, device=device)
+            expert_outputs = self.experts[expert_idx](pooled[token_indices]).squeeze(-1)
+            route_scores[token_indices, route_positions] = expert_outputs
+
+        accepted_weights = topk_weights * accepted_mask.to(topk_weights.dtype)
+        if self.moe_score_merge == "weighted_sum":
+            weight_denom = accepted_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+            merge_weights = accepted_weights / weight_denom
+            scores = torch.sum(merge_weights * route_scores, dim=-1)
+        else:
+            scores = torch.zeros(batch_size, dtype=dtype, device=device)
+            taken = torch.zeros(batch_size, dtype=torch.bool, device=device)
+            for route_pos in range(self.router_top_k):
+                route_mask = accepted_mask[:, route_pos] & (~taken)
+                scores[route_mask] = route_scores[route_mask, route_pos]
+                taken = taken | route_mask
+
+        importance = router_probs.mean(dim=0)
+        total_routed = expert_counts.sum().to(dtype).clamp(min=1.0)
+        load = expert_counts.to(dtype) / total_routed
+        aux_loss = self.num_experts * torch.sum(importance * load)
+        z_loss = torch.mean(torch.logsumexp(router_logits, dim=-1) ** 2)
+        router_entropy = -torch.sum(router_probs * torch.log(router_probs.clamp(min=1e-9)), dim=-1).mean()
+        dropped_tokens = (~accepted_mask.any(dim=-1)).sum()
+
+        router_info = {
+            "importance": importance.detach(),
+            "load": load.detach(),
+            "expert_counts": expert_counts.detach(),
+            "overflow_count": overflow_count.detach(),
+            "dropped_tokens": dropped_tokens.detach(),
+            "router_entropy": router_entropy.detach(),
+            "aux_loss": aux_loss,
+            "z_loss": z_loss,
+            "max_expert_share": load.max().detach(),
+            "capacity": torch.tensor(capacity, dtype=torch.long, device=device),
+        }
+
+        if return_router_info:
+            return scores, router_info
+        return scores
+
+    @torch.no_grad()
+    def reset_parameters(self):
+        if self._init_state is not None:
+            self.load_state_dict(self._init_state, strict=True)
+        else:
+            for m in self.modules():
+                if isinstance(m, nn.Linear):
+                    m.reset_parameters()
+
+    def get_trainable_params(self):
+        return list(self.parameters())
+
+
+def _aggregate_router_infos(router_infos: List[Dict[str, torch.Tensor]], num_experts: int, device: torch.device):
+    if not router_infos:
+        return None
+
+    importance = torch.stack([info["importance"].to(device) for info in router_infos], dim=0).mean(dim=0)
+    load = torch.stack([info["load"].to(device) for info in router_infos], dim=0).mean(dim=0)
+    expert_counts = torch.stack(
+        [info["expert_counts"].to(device=device, dtype=torch.float32) for info in router_infos],
+        dim=0,
+    ).sum(dim=0)
+    overflow_count = torch.stack(
+        [info["overflow_count"].to(device=device, dtype=torch.float32) for info in router_infos],
+        dim=0,
+    ).sum()
+    dropped_tokens = torch.stack(
+        [info["dropped_tokens"].to(device=device, dtype=torch.float32) for info in router_infos],
+        dim=0,
+    ).sum()
+    router_entropy = torch.stack([info["router_entropy"].to(device) for info in router_infos], dim=0).mean()
+    aux_loss = torch.stack([info["aux_loss"] for info in router_infos], dim=0).mean()
+    z_loss = torch.stack([info["z_loss"] for info in router_infos], dim=0).mean()
+    capacity = max(int(info["capacity"].detach().item()) for info in router_infos if "capacity" in info)
+
+    return {
+        "importance": importance,
+        "load": load,
+        "expert_counts": expert_counts.round().to(dtype=torch.long),
+        "overflow_count": overflow_count.round().to(dtype=torch.long),
+        "dropped_tokens": dropped_tokens.round().to(dtype=torch.long),
+        "router_entropy": router_entropy,
+        "aux_loss": aux_loss,
+        "z_loss": z_loss,
+        "max_expert_share": load.max(),
+        "capacity": torch.tensor(capacity, dtype=torch.long, device=device),
+        "num_experts": int(num_experts),
+    }
+
+
 def infer_source_names(*raw_datasets) -> List[str]:
     names = set()
     for raw_dataset in raw_datasets:
@@ -178,6 +390,13 @@ def build_datarater_model(
     model_name: str = ESM_MODEL_NAME,
     cache_init_state: bool = True,
     force_eager_attn: bool = False,
+    num_experts: int = 4,
+    router_top_k: int = 2,
+    capacity_factor: float = 1.25,
+    router_temperature: float = 1.0,
+    router_noise_std: float = 0.0,
+    moe_score_merge: str = "weighted_sum",
+    drop_overflow_tokens: bool = True,
 ) -> nn.Module:
     if arch == "single":
         return ESMForAffinity(
@@ -196,6 +415,19 @@ def build_datarater_model(
         return MultiHeadDataRater(
             source_names=uniq_sources,
             model_name=model_name,
+            cache_init_state=cache_init_state,
+            force_eager_attn=force_eager_attn,
+        )
+    if arch == "moe":
+        return MoEDataRater(
+            model_name=model_name,
+            num_experts=num_experts,
+            router_top_k=router_top_k,
+            capacity_factor=capacity_factor,
+            router_temperature=router_temperature,
+            router_noise_std=router_noise_std,
+            moe_score_merge=moe_score_merge,
+            drop_overflow_tokens=drop_overflow_tokens,
             cache_init_state=cache_init_state,
             force_eager_attn=force_eager_attn,
         )
@@ -239,11 +471,20 @@ def datarater_forward(
     attention_mask: torch.Tensor,
     raw_indices=None,
     raw_dataset=None,
-) -> torch.Tensor:
+    return_router_info: bool = False,
+):
     if isinstance(data_rater, MultiHeadDataRater):
         batch_sources = _batch_sources_from_raw_indices(raw_indices, raw_dataset)
-        return data_rater(input_ids, attention_mask, batch_sources)
-    return data_rater(input_ids, attention_mask)
+        scores = data_rater(input_ids, attention_mask, batch_sources)
+        if return_router_info:
+            return scores, None
+        return scores
+    if isinstance(data_rater, MoEDataRater):
+        return data_rater(input_ids, attention_mask, return_router_info=return_router_info)
+    scores = data_rater(input_ids, attention_mask)
+    if return_router_info:
+        return scores, None
+    return scores
 
 
 def _resolve_requested_sources(requested: Sequence[str], available: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -587,6 +828,15 @@ def train_datarater(
     outer_sampling: str = "random",
     outer_per_source: Optional[int] = None,
     hard_outer_sources: Optional[Sequence[str]] = None,
+    num_experts: int = 4,
+    router_top_k: int = 2,
+    capacity_factor: float = 1.25,
+    router_aux_loss_coef: float = 0.01,
+    router_z_loss_coef: float = 0.0,
+    router_noise_std: float = 0.0,
+    router_temperature: float = 1.0,
+    moe_score_merge: str = "weighted_sum",
+    drop_overflow_tokens: bool = True,
 ) -> nn.Module:
     """
     Meta-learn DataRater weights for samples.
@@ -607,10 +857,14 @@ def train_datarater(
             raise ValueError(f"outer_objective must be one of {sorted(allowed_objectives)}")
         if not (0.0 <= alpha <= 1.0):
             raise ValueError("alpha must be in [0, 1].")
-        if datarater_arch not in {"single", "multihead"}:
-            raise ValueError("datarater_arch must be one of {'single', 'multihead'}.")
+        if datarater_arch not in {"single", "multihead", "moe"}:
+            raise ValueError("datarater_arch must be one of {'single', 'multihead', 'moe'}.")
         if outer_sampling not in {"random", "balanced", "harder"}:
             raise ValueError("outer_sampling must be one of {'random', 'balanced', 'harder'}.")
+        if router_aux_loss_coef < 0.0:
+            raise ValueError("router_aux_loss_coef must be non-negative.")
+        if router_z_loss_coef < 0.0:
+            raise ValueError("router_z_loss_coef must be non-negative.")
 
         # v2: clamp T_backprop
         T_backprop_eff = min(T_backprop, T_window)
@@ -653,6 +907,21 @@ def train_datarater(
         source_names = infer_source_names(train_raw, val_raw)
         if datarater_arch == "multihead":
             logger.info("[meta] multi-head sources=%s", source_names)
+        if datarater_arch == "moe":
+            logger.info(
+                "[meta] moe config | experts=%d | top_k=%d | capacity_factor=%.3f | "
+                "router_tau=%.3f | router_noise_std=%.3f | merge=%s | drop_overflow=%s | "
+                "aux_coef=%.4f | z_coef=%.4f",
+                num_experts,
+                router_top_k,
+                capacity_factor,
+                router_temperature,
+                router_noise_std,
+                moe_score_merge,
+                drop_overflow_tokens,
+                router_aux_loss_coef,
+                router_z_loss_coef,
+            )
 
         # DataRater (heavy)
         data_rater = build_datarater_model(
@@ -660,6 +929,13 @@ def train_datarater(
             source_names=source_names,
             cache_init_state=True,
             force_eager_attn=force_eager_attn,
+            num_experts=num_experts,
+            router_top_k=router_top_k,
+            capacity_factor=capacity_factor,
+            router_temperature=router_temperature,
+            router_noise_std=router_noise_std,
+            moe_score_merge=moe_score_merge,
+            drop_overflow_tokens=drop_overflow_tokens,
         ).to(device)
         rater_opt = torch.optim.Adam(data_rater.parameters(), lr=1e-4)
 
@@ -694,10 +970,12 @@ def train_datarater(
 
             rater_opt.zero_grad(set_to_none=True)
             meta_grads_accumulator = []
+            step_router_infos = []
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
                 fast_weights = dict(inner_model.named_parameters())
+                model_router_infos = []
 
                 # ---- inner loop (v2: K-step truncated BPTT) ----
                 for _t in range(T_window):
@@ -722,13 +1000,25 @@ def train_datarater(
                     # v2: only build graph for the last T_backprop steps
                     is_graph_step = (_t >= T_warmup)
 
-                    raw_scores = datarater_forward(
-                        data_rater,
-                        input_ids,
-                        mask,
-                        raw_indices=x_in.get("raw_index"),
-                        raw_dataset=train_raw,
-                    )      # [B]
+                    if datarater_arch == "moe":
+                        raw_scores, router_info = datarater_forward(
+                            data_rater,
+                            input_ids,
+                            mask,
+                            raw_indices=x_in.get("raw_index"),
+                            raw_dataset=train_raw,
+                            return_router_info=True,
+                        )
+                        if router_info is not None:
+                            model_router_infos.append(router_info)
+                    else:
+                        raw_scores = datarater_forward(
+                            data_rater,
+                            input_ids,
+                            mask,
+                            raw_indices=x_in.get("raw_index"),
+                            raw_dataset=train_raw,
+                        )      # [B]
                     weights = F.softmax(raw_scores / tau, dim=0)  # [B]
 
                     preds = functional_forward(inner_model, fast_weights, input_ids, mask)
@@ -798,6 +1088,12 @@ def train_datarater(
                     mse_norm_eps=mse_norm_eps,
                     source_labels=batch_source_labels,
                 )
+                if datarater_arch == "moe":
+                    model_router_info = _aggregate_router_infos(model_router_infos, num_experts, device)
+                    if model_router_info is not None:
+                        outer_loss = outer_loss + router_aux_loss_coef * model_router_info["aux_loss"]
+                        outer_loss = outer_loss + router_z_loss_coef * model_router_info["z_loss"]
+                        step_router_infos.append(model_router_info)
 
                 if use_first_order_ablation:
                     # Keep direct path to DataRater in first-order mode.
@@ -842,6 +1138,20 @@ def train_datarater(
                     )
                     if batch_src_std is not None:
                         msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
+                    if datarater_arch == "moe":
+                        step_router_info = _aggregate_router_infos(step_router_infos, num_experts, device)
+                        if step_router_info is not None:
+                            expert_counts = step_router_info["expert_counts"].detach().cpu().tolist()
+                            msg += (
+                                f" | router_aux={float(step_router_info['aux_loss'].detach().item()):.6f}"
+                                f" | router_z={float(step_router_info['z_loss'].detach().item()):.6f}"
+                                f" | router_entropy={float(step_router_info['router_entropy'].detach().item()):.6f}"
+                                f" | max_share={float(step_router_info['max_expert_share'].detach().item()):.4f}"
+                                f" | overflow={int(step_router_info['overflow_count'].detach().item())}"
+                                f" | dropped={int(step_router_info['dropped_tokens'].detach().item())}"
+                                f" | capacity={int(step_router_info['capacity'].detach().item())}"
+                                f" | expert_counts={expert_counts}"
+                            )
                 logger.info(msg)
 
         return data_rater
