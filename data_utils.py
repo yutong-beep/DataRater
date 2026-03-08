@@ -112,6 +112,10 @@ def download_and_split(
         df = df.dropna(how="all")
         if mode == "all":
             df = _normalize_ppba_schema(df, filename=fn)
+        elif "source" not in df.columns:
+            # Keep multi-head/source-aware phase-2 runs working in combined_train mode.
+            df = df.copy()
+            df["source"] = fn.replace(".parquet", "")
         per_file_counts[fn] = len(df)
         dfs.append(df)
 

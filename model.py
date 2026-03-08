@@ -604,6 +604,15 @@ def _sample_outer_batch(outer_sampler):
     return outer_sampler["collate_fn"](samples)
 
 
+def _next_batch(batch_iter, loader):
+    try:
+        batch = next(batch_iter)
+    except StopIteration:
+        batch_iter = iter(loader)
+        batch = next(batch_iter)
+    return batch, batch_iter
+
+
 def functional_forward(model: nn.Module, params: Dict[str, torch.Tensor], input_ids, attention_mask) -> torch.Tensor:
     return functional_call(model, params, (input_ids, attention_mask)).squeeze(-1)
 
@@ -747,6 +756,34 @@ def _zscore_normalize_targets(
     return (targets - means_t) / stds_t
 
 
+def _zscore_unnormalize_preds(
+    preds: torch.Tensor,
+    raw_indices: torch.Tensor,
+    raw_dataset,
+    src2stats: Dict[str, Tuple[float, float]],
+    global_mean: float,
+    global_std: float,
+) -> torch.Tensor:
+    device = preds.device
+    means = []
+    stds = []
+    n_raw = len(raw_dataset)
+    has_source = "source" in raw_dataset.column_names
+
+    for idx in raw_indices.detach().cpu().tolist():
+        if 0 <= int(idx) < n_raw and has_source:
+            src = str(raw_dataset[int(idx)]["source"])
+            m, s = src2stats.get(src, (global_mean, global_std))
+        else:
+            m, s = global_mean, global_std
+        means.append(m)
+        stds.append(s)
+
+    means_t = torch.tensor(means, dtype=torch.float32, device=device)
+    stds_t = torch.tensor(stds, dtype=torch.float32, device=device)
+    return preds * stds_t + means_t
+
+
 def _lookup_batch_src_std(
     raw_indices: torch.Tensor,
     val_raw,
@@ -764,6 +801,40 @@ def _lookup_batch_src_std(
             src_std = src2std.get(src, global_std)
         vals.append(float(src_std))
     return torch.tensor(vals, dtype=torch.float32, device=device)
+
+
+def _first_order_weighted_grads(
+    per_sample_loss: torch.Tensor,
+    weights: torch.Tensor,
+    params: Sequence[torch.Tensor],
+) -> Tuple[Optional[torch.Tensor], ...]:
+    if per_sample_loss.ndim != 1:
+        raise ValueError("per_sample_loss must be a 1D tensor.")
+    if weights.shape != per_sample_loss.shape:
+        raise ValueError("weights and per_sample_loss must have the same shape.")
+
+    accum: List[Optional[torch.Tensor]] = [None] * len(params)
+    batch_size = int(per_sample_loss.numel())
+
+    for sample_idx in range(batch_size):
+        sample_grads = torch.autograd.grad(
+            per_sample_loss[sample_idx],
+            tuple(params),
+            retain_graph=sample_idx + 1 < batch_size,
+            create_graph=False,
+            allow_unused=True,
+        )
+        sample_weight = weights[sample_idx]
+        for param_idx, sample_grad in enumerate(sample_grads):
+            if sample_grad is None:
+                continue
+            contrib = sample_weight * sample_grad.detach()
+            if accum[param_idx] is None:
+                accum[param_idx] = contrib
+            else:
+                accum[param_idx] = accum[param_idx] + contrib
+
+    return tuple(accum)
 
 
 def _compute_outer_loss(
@@ -912,6 +983,12 @@ def train_datarater(
         source_names = infer_source_names(train_raw, val_raw)
         if datarater_arch == "multihead":
             logger.info("[meta] multi-head sources=%s", source_names)
+            if len(source_names) <= 1:
+                logger.warning(
+                    "[meta] datarater_arch='multihead' but only %d source was found. "
+                    "This run will behave like a single shared head; use data_mode='all' for real per-source heads.",
+                    len(source_names),
+                )
         if datarater_arch == "moe":
             logger.info(
                 "[meta] moe config | experts=%d | top_k=%d | capacity_factor=%.3f | "
@@ -974,72 +1051,138 @@ def train_datarater(
             )
 
             rater_opt.zero_grad(set_to_none=True)
-            meta_grads_accumulator = []
             step_router_infos = []
+            outer_loss_values = []
+
+            inner_batches = []
+            for _ in range(T_window):
+                x_in, train_iter = _next_batch(train_iter, train_loader)
+                inner_batches.append(x_in)
+
+            if outer_sampling == "random":
+                x_out, val_iter = _next_batch(val_iter, val_loader)
+            else:
+                x_out = _sample_outer_batch(outer_sampler)
+
+            shared_inner_steps = []
+            for _t, x_in in enumerate(inner_batches):
+                input_ids = x_in["input_ids"].to(device)
+                mask = x_in["attention_mask"].to(device)
+                raw_index = x_in.get("raw_index")
+                if raw_index is not None:
+                    raw_index = raw_index.to(device)
+
+                targets = x_in["affinity"].to(device)
+                inner_targets = targets
+                if use_zscore_inner and src2zscore and raw_index is not None:
+                    inner_targets = _zscore_normalize_targets(
+                        targets,
+                        raw_index,
+                        train_raw,
+                        src2zscore,
+                        zscore_global_mean,
+                        zscore_global_std,
+                    )
+
+                if datarater_arch == "moe":
+                    raw_scores, router_info = datarater_forward(
+                        data_rater,
+                        input_ids,
+                        mask,
+                        raw_indices=raw_index,
+                        raw_dataset=train_raw,
+                        return_router_info=True,
+                    )
+                    if router_info is not None:
+                        step_router_infos.append(router_info)
+                else:
+                    raw_scores = datarater_forward(
+                        data_rater,
+                        input_ids,
+                        mask,
+                        raw_indices=raw_index,
+                        raw_dataset=train_raw,
+                    )
+                weights = F.softmax(raw_scores / tau, dim=0)
+
+                track_weight_grad = (_t >= T_warmup)
+                if not track_weight_grad:
+                    weights = weights.detach()
+
+                shared_inner_steps.append(
+                    {
+                        "input_ids": input_ids,
+                        "attention_mask": mask,
+                        "targets": inner_targets,
+                        "weights": weights,
+                        "track_weight_grad": track_weight_grad,
+                    }
+                )
+
+            tracked_weight_tensors = [
+                step_state["weights"]
+                for step_state in shared_inner_steps
+                if step_state["track_weight_grad"]
+            ]
+            tracked_weight_grads = [torch.zeros_like(weight_t) for weight_t in tracked_weight_tensors]
+
+            out_ids = x_out["input_ids"].to(device)
+            out_mask = x_out["attention_mask"].to(device)
+            out_targets = x_out["affinity"].to(device)
+            out_raw_index = x_out.get("raw_index")
+            if out_raw_index is not None:
+                out_raw_index = out_raw_index.to(device)
+
+            batch_src_std = None
+            if outer_objective in {"mse_norm", "mix"}:
+                if out_raw_index is not None and val_raw is not None:
+                    batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
+                else:
+                    batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
+
+            batch_source_labels = None
+            if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
+                n_val = len(val_raw)
+                has_src = "source" in val_raw.column_names
+                batch_source_labels = []
+                for idx in out_raw_index.detach().cpu().tolist():
+                    if 0 <= int(idx) < n_val and has_src:
+                        batch_source_labels.append(str(val_raw[int(idx)]["source"]))
+                    else:
+                        batch_source_labels.append("__unknown__")
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
                 fast_weights = dict(inner_model.named_parameters())
-                model_router_infos = []
 
                 # ---- inner loop (v2: K-step truncated BPTT) ----
-                for _t in range(T_window):
-                    try:
-                        x_in = next(train_iter)
-                    except StopIteration:
-                        train_iter = iter(train_loader)
-                        x_in = next(train_iter)
-
-                    input_ids = x_in["input_ids"].to(device)
-                    mask = x_in["attention_mask"].to(device)
-                    targets = x_in["affinity"].to(device)
-
-                    # v2: per-source z-score normalization of inner targets
-                    if use_zscore_inner and src2zscore and "raw_index" in x_in:
-                        targets = _zscore_normalize_targets(
-                            targets, x_in["raw_index"].to(device),
-                            train_raw, src2zscore,
-                            zscore_global_mean, zscore_global_std,
-                        )
-
-                    # v2: only build graph for the last T_backprop steps
-                    is_graph_step = (_t >= T_warmup)
-
-                    if datarater_arch == "moe":
-                        raw_scores, router_info = datarater_forward(
-                            data_rater,
-                            input_ids,
-                            mask,
-                            raw_indices=x_in.get("raw_index"),
-                            raw_dataset=train_raw,
-                            return_router_info=True,
-                        )
-                        if router_info is not None:
-                            model_router_infos.append(router_info)
-                    else:
-                        raw_scores = datarater_forward(
-                            data_rater,
-                            input_ids,
-                            mask,
-                            raw_indices=x_in.get("raw_index"),
-                            raw_dataset=train_raw,
-                        )      # [B]
-                    weights = F.softmax(raw_scores / tau, dim=0)  # [B]
+                for step_state in shared_inner_steps:
+                    input_ids = step_state["input_ids"]
+                    mask = step_state["attention_mask"]
+                    targets = step_state["targets"]
+                    weights = step_state["weights"]
+                    is_graph_step = bool(step_state["track_weight_grad"])
 
                     preds = functional_forward(inner_model, fast_weights, input_ids, mask)
-                    per = F.mse_loss(preds, targets, reduction="none")
-                    inner_loss = torch.sum(weights * per)
+                    per = F.mse_loss(preds.float(), targets.float(), reduction="none")
 
-                    need_graph = is_graph_step and (not use_first_order_ablation)
-                    grads = torch.autograd.grad(
-                        inner_loss,
-                        tuple(fast_weights.values()),
-                        create_graph=need_graph,
-                        allow_unused=True,
-                    )
-
-                    if not need_graph:
-                        grads = [g.detach() if g is not None else None for g in grads]
+                    if use_first_order_ablation and is_graph_step:
+                        grads = _first_order_weighted_grads(
+                            per_sample_loss=per,
+                            weights=weights.float(),
+                            params=tuple(fast_weights.values()),
+                        )
+                    else:
+                        inner_loss = torch.sum(weights.float() * per)
+                        need_graph = is_graph_step and (not use_first_order_ablation)
+                        grads = torch.autograd.grad(
+                            inner_loss,
+                            tuple(fast_weights.values()),
+                            create_graph=need_graph,
+                            allow_unused=True,
+                        )
+                        if not need_graph:
+                            grads = [g.detach() if g is not None else None for g in grads]
 
                     fast_weights = {
                         name: (w - inner_lr * g) if g is not None else w
@@ -1047,41 +1190,16 @@ def train_datarater(
                     }
 
                 # ---- outer loop ----
-                if outer_sampling == "random":
-                    try:
-                        x_out = next(val_iter)
-                    except StopIteration:
-                        val_iter = iter(val_loader)
-                        x_out = next(val_iter)
-                else:
-                    x_out = _sample_outer_batch(outer_sampler)
-
-                out_ids = x_out["input_ids"].to(device)
-                out_mask = x_out["attention_mask"].to(device)
-                out_targets = x_out["affinity"].to(device)
-                out_raw_index = x_out.get("raw_index")
-                if out_raw_index is not None:
-                    out_raw_index = out_raw_index.to(device)
-
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
-                batch_src_std = None
-                if outer_objective in {"mse_norm", "mix"}:
-                    if out_raw_index is not None and val_raw is not None:
-                        batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
-                    else:
-                        batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
-
-                # v2: get source labels for stratified outer loss
-                batch_source_labels = None
-                if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
-                    n_val = len(val_raw)
-                    has_src = "source" in val_raw.column_names
-                    batch_source_labels = []
-                    for idx in out_raw_index.detach().cpu().tolist():
-                        if 0 <= int(idx) < n_val and has_src:
-                            batch_source_labels.append(str(val_raw[int(idx)]["source"]))
-                        else:
-                            batch_source_labels.append("__unknown__")
+                if use_zscore_inner and src2zscore and out_raw_index is not None and val_raw is not None:
+                    outer_preds = _zscore_unnormalize_preds(
+                        outer_preds,
+                        out_raw_index,
+                        val_raw,
+                        src2zscore,
+                        zscore_global_mean,
+                        zscore_global_std,
+                    )
 
                 outer_loss = _compute_outer_loss(
                     objective=outer_objective,
@@ -1093,41 +1211,61 @@ def train_datarater(
                     mse_norm_eps=mse_norm_eps,
                     source_labels=batch_source_labels,
                 )
-                if datarater_arch == "moe":
-                    model_router_info = _aggregate_router_infos(model_router_infos, num_experts, device)
-                    if model_router_info is not None:
-                        outer_loss = outer_loss + router_aux_loss_coef * model_router_info["aux_loss"]
-                        outer_loss = outer_loss + router_z_loss_coef * model_router_info["z_loss"]
-                        step_router_infos.append(model_router_info)
+                outer_loss_values.append(float(outer_loss.detach().item()))
 
-                if use_first_order_ablation:
-                    # Keep direct path to DataRater in first-order mode.
-                    out_scores = datarater_forward(
-                        data_rater,
-                        out_ids,
-                        out_mask,
-                        raw_indices=out_raw_index,
-                        raw_dataset=val_raw,
+                if tracked_weight_tensors:
+                    weight_grads = torch.autograd.grad(
+                        outer_loss,
+                        tuple(tracked_weight_tensors),
+                        allow_unused=True,
                     )
-                    out_w = F.softmax(out_scores / tau, dim=0)
-                    outer_loss = outer_loss + 0.01 * torch.sum(out_w * (outer_preds.detach() - out_targets).pow(2))
-
-                meta_grads = torch.autograd.grad(
-                    outer_loss,
-                    tuple(data_rater.parameters()),
-                    allow_unused=True,
-                )
-                meta_grads_accumulator.append(meta_grads)
+                    for grad_idx, weight_grad in enumerate(weight_grads):
+                        if weight_grad is None:
+                            continue
+                        tracked_weight_grads[grad_idx] = tracked_weight_grads[grad_idx] + weight_grad.detach()
 
                 # truncate and sync
                 with torch.no_grad():
                     for name, p in inner_model.named_parameters():
                         p.copy_(fast_weights[name].detach())
 
-            # ---- apply averaged grads ----
-            params = list(data_rater.parameters())
-            for p, grads_for_p in zip(params, zip(*meta_grads_accumulator)):
-                p.grad = _safe_mean(list(grads_for_p), p)
+            mean_weight_grads = [
+                grad_t / float(len(models_to_process))
+                for grad_t in tracked_weight_grads
+            ]
+
+            router_reg = None
+            step_router_info = None
+            if datarater_arch == "moe":
+                step_router_info = _aggregate_router_infos(step_router_infos, num_experts, device)
+                if step_router_info is not None:
+                    reg_terms = []
+                    if router_aux_loss_coef > 0.0:
+                        reg_terms.append(router_aux_loss_coef * step_router_info["aux_loss"])
+                    if router_z_loss_coef > 0.0:
+                        reg_terms.append(router_z_loss_coef * step_router_info["z_loss"])
+                    if reg_terms:
+                        router_reg = torch.stack(reg_terms).sum()
+
+            params = tuple(data_rater.parameters())
+            meta_outputs = list(tracked_weight_tensors)
+            meta_grad_outputs = list(mean_weight_grads)
+            if router_reg is not None:
+                meta_outputs.append(router_reg)
+                meta_grad_outputs.append(torch.ones_like(router_reg))
+
+            if meta_outputs:
+                meta_grads = torch.autograd.grad(
+                    tuple(meta_outputs),
+                    params,
+                    grad_outputs=tuple(meta_grad_outputs),
+                    allow_unused=True,
+                )
+            else:
+                meta_grads = tuple(None for _ in params)
+
+            for p, g in zip(params, meta_grads):
+                p.grad = torch.zeros_like(p) if g is None else g
 
             rater_opt.step()
 
@@ -1136,7 +1274,10 @@ def train_datarater(
                     gsum = 0.0
                     for p in data_rater.parameters():
                         gsum += float(p.grad.norm().item()) if p.grad is not None else 0.0
-                    outer_loss_value = float(outer_loss.detach().item())
+                    outer_loss_value = (
+                        sum(outer_loss_values) / float(len(outer_loss_values))
+                        if outer_loss_values else 0.0
+                    )
                     msg = (
                         f"[meta] step {step+1}/{n_meta_steps} | obj={outer_objective} "
                         f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f}"
@@ -1144,7 +1285,6 @@ def train_datarater(
                     if batch_src_std is not None:
                         msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
                     if datarater_arch == "moe":
-                        step_router_info = _aggregate_router_infos(step_router_infos, num_experts, device)
                         if step_router_info is not None:
                             expert_counts = step_router_info["expert_counts"].detach().cpu().tolist()
                             msg += (
