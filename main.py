@@ -397,7 +397,7 @@ def main():
 
     # Output dir with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_prefix = f"p2_{args.datarater_arch}_{args.outer_sampling}outer"
+    run_prefix = f"p4_mixflow_{args.datarater_arch}_{args.outer_sampling}outer"
     run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 

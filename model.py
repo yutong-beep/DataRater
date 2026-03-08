@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from transformers import EsmModel
 from torch.func import functional_call
 
+from mixflow_mg import mixflow_inner_update
+
 logger = logging.getLogger(__name__)
 
 ESM_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"
@@ -492,6 +494,22 @@ def datarater_forward(
     return scores
 
 
+def functional_datarater_forward(
+    data_rater: nn.Module,
+    params: Dict[str, torch.Tensor],
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    raw_indices=None,
+    raw_dataset=None,
+):
+    if isinstance(data_rater, MultiHeadDataRater):
+        batch_sources = _batch_sources_from_raw_indices(raw_indices, raw_dataset)
+        return functional_call(data_rater, params, (input_ids, attention_mask, batch_sources))
+    if isinstance(data_rater, MoEDataRater):
+        return functional_call(data_rater, params, (input_ids, attention_mask))
+    return functional_call(data_rater, params, (input_ids, attention_mask))
+
+
 def _resolve_requested_sources(requested: Sequence[str], available: Sequence[str]) -> Tuple[List[str], List[str]]:
     norm_to_actual = {_normalize_source_name(src): str(src) for src in available}
     resolved = []
@@ -941,6 +959,12 @@ def train_datarater(
             raise ValueError("router_aux_loss_coef must be non-negative.")
         if router_z_loss_coef < 0.0:
             raise ValueError("router_z_loss_coef must be non-negative.")
+        if datarater_arch == "moe" and router_noise_std > 0.0:
+            logger.warning(
+                "[meta] p4-mixflow forces router_noise_std from %.4f to 0.0 so MixFlow recomputation stays deterministic.",
+                router_noise_std,
+            )
+            router_noise_std = 0.0
 
         # v2: clamp T_backprop
         T_backprop_eff = min(T_backprop, T_window)
@@ -1037,6 +1061,11 @@ def train_datarater(
             hard_outer_sources=hard_outer_sources,
         )
 
+        if use_first_order_ablation:
+            logger.warning(
+                "[meta] p4-mixflow ignores --ablation; MixFlow-MG already uses exact local JVP backward without the old surrogate path."
+            )
+
         data_rater.train()
 
         for step in range(n_meta_steps):
@@ -1051,8 +1080,9 @@ def train_datarater(
             )
 
             rater_opt.zero_grad(set_to_none=True)
-            step_router_infos = []
+            meta_grads_accumulator = []
             outer_loss_values = []
+            step_router_infos = []
 
             inner_batches = []
             for _ in range(T_window):
@@ -1064,28 +1094,14 @@ def train_datarater(
             else:
                 x_out = _sample_outer_batch(outer_sampler)
 
-            shared_inner_steps = []
-            for _t, x_in in enumerate(inner_batches):
-                input_ids = x_in["input_ids"].to(device)
-                mask = x_in["attention_mask"].to(device)
-                raw_index = x_in.get("raw_index")
-                if raw_index is not None:
-                    raw_index = raw_index.to(device)
-
-                targets = x_in["affinity"].to(device)
-                inner_targets = targets
-                if use_zscore_inner and src2zscore and raw_index is not None:
-                    inner_targets = _zscore_normalize_targets(
-                        targets,
-                        raw_index,
-                        train_raw,
-                        src2zscore,
-                        zscore_global_mean,
-                        zscore_global_std,
-                    )
-
-                if datarater_arch == "moe":
-                    raw_scores, router_info = datarater_forward(
+            if datarater_arch == "moe":
+                for x_in in inner_batches:
+                    input_ids = x_in["input_ids"].to(device)
+                    mask = x_in["attention_mask"].to(device)
+                    raw_index = x_in.get("raw_index")
+                    if raw_index is not None:
+                        raw_index = raw_index.to(device)
+                    _, router_info = datarater_forward(
                         data_rater,
                         input_ids,
                         mask,
@@ -1095,36 +1111,6 @@ def train_datarater(
                     )
                     if router_info is not None:
                         step_router_infos.append(router_info)
-                else:
-                    raw_scores = datarater_forward(
-                        data_rater,
-                        input_ids,
-                        mask,
-                        raw_indices=raw_index,
-                        raw_dataset=train_raw,
-                    )
-                weights = F.softmax(raw_scores / tau, dim=0)
-
-                track_weight_grad = (_t >= T_warmup)
-                if not track_weight_grad:
-                    weights = weights.detach()
-
-                shared_inner_steps.append(
-                    {
-                        "input_ids": input_ids,
-                        "attention_mask": mask,
-                        "targets": inner_targets,
-                        "weights": weights,
-                        "track_weight_grad": track_weight_grad,
-                    }
-                )
-
-            tracked_weight_tensors = [
-                step_state["weights"]
-                for step_state in shared_inner_steps
-                if step_state["track_weight_grad"]
-            ]
-            tracked_weight_grads = [torch.zeros_like(weight_t) for weight_t in tracked_weight_tensors]
 
             out_ids = x_out["input_ids"].to(device)
             out_mask = x_out["attention_mask"].to(device)
@@ -1151,45 +1137,69 @@ def train_datarater(
                     else:
                         batch_source_labels.append("__unknown__")
 
+            params = tuple(data_rater.parameters())
+
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
                 fast_weights = dict(inner_model.named_parameters())
 
-                # ---- inner loop (v2: K-step truncated BPTT) ----
-                for step_state in shared_inner_steps:
-                    input_ids = step_state["input_ids"]
-                    mask = step_state["attention_mask"]
-                    targets = step_state["targets"]
-                    weights = step_state["weights"]
-                    is_graph_step = bool(step_state["track_weight_grad"])
+                for inner_step_idx, x_in in enumerate(inner_batches):
+                    input_ids = x_in["input_ids"].to(device)
+                    mask = x_in["attention_mask"].to(device)
+                    targets = x_in["affinity"].to(device)
+                    raw_index = x_in.get("raw_index")
+                    if raw_index is not None:
+                        raw_index = raw_index.to(device)
 
-                    preds = functional_forward(inner_model, fast_weights, input_ids, mask)
-                    per = F.mse_loss(preds.float(), targets.float(), reduction="none")
-
-                    if use_first_order_ablation and is_graph_step:
-                        grads = _first_order_weighted_grads(
-                            per_sample_loss=per,
-                            weights=weights.float(),
-                            params=tuple(fast_weights.values()),
+                    if use_zscore_inner and src2zscore and raw_index is not None:
+                        targets = _zscore_normalize_targets(
+                            targets,
+                            raw_index,
+                            train_raw,
+                            src2zscore,
+                            zscore_global_mean,
+                            zscore_global_std,
                         )
-                    else:
+
+                    if inner_step_idx < T_warmup:
+                        raw_scores = datarater_forward(
+                            data_rater,
+                            input_ids,
+                            mask,
+                            raw_indices=raw_index,
+                            raw_dataset=train_raw,
+                        )
+                        weights = F.softmax(raw_scores / tau, dim=0).detach()
+                        preds = functional_forward(inner_model, fast_weights, input_ids, mask)
+                        per = F.mse_loss(preds.float(), targets.float(), reduction="none")
                         inner_loss = torch.sum(weights.float() * per)
-                        need_graph = is_graph_step and (not use_first_order_ablation)
                         grads = torch.autograd.grad(
                             inner_loss,
                             tuple(fast_weights.values()),
-                            create_graph=need_graph,
+                            create_graph=False,
                             allow_unused=True,
                         )
-                        if not need_graph:
-                            grads = [g.detach() if g is not None else None for g in grads]
+                        grads = [g.detach() if g is not None else None for g in grads]
+                        fast_weights = {
+                            name: ((weight - inner_lr * grad_value) if grad_value is not None else weight).detach()
+                            for (name, weight), grad_value in zip(fast_weights.items(), grads)
+                        }
+                    else:
+                        fast_weights = mixflow_inner_update(
+                            inner_model=inner_model,
+                            data_rater=data_rater,
+                            fast_weights=fast_weights,
+                            input_ids=input_ids,
+                            attention_mask=mask,
+                            targets=targets,
+                            tau=tau,
+                            inner_lr=inner_lr,
+                            functional_forward_fn=functional_forward,
+                            functional_datarater_forward_fn=functional_datarater_forward,
+                            raw_indices=raw_index,
+                            raw_dataset=train_raw,
+                        )
 
-                    fast_weights = {
-                        name: (w - inner_lr * g) if g is not None else w
-                        for (name, w), g in zip(fast_weights.items(), grads)
-                    }
-
-                # ---- outer loop ----
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
                 if use_zscore_inner and src2zscore and out_raw_index is not None and val_raw is not None:
                     outer_preds = _zscore_unnormalize_preds(
@@ -1213,26 +1223,19 @@ def train_datarater(
                 )
                 outer_loss_values.append(float(outer_loss.detach().item()))
 
-                if tracked_weight_tensors:
-                    weight_grads = torch.autograd.grad(
-                        outer_loss,
-                        tuple(tracked_weight_tensors),
-                        allow_unused=True,
-                    )
-                    for grad_idx, weight_grad in enumerate(weight_grads):
-                        if weight_grad is None:
-                            continue
-                        tracked_weight_grads[grad_idx] = tracked_weight_grads[grad_idx] + weight_grad.detach()
+                meta_grads = torch.autograd.grad(
+                    outer_loss,
+                    params,
+                    allow_unused=True,
+                )
+                meta_grads_accumulator.append(meta_grads)
 
-                # truncate and sync
                 with torch.no_grad():
-                    for name, p in inner_model.named_parameters():
-                        p.copy_(fast_weights[name].detach())
+                    for name, param in inner_model.named_parameters():
+                        param.copy_(fast_weights[name].detach())
 
-            mean_weight_grads = [
-                grad_t / float(len(models_to_process))
-                for grad_t in tracked_weight_grads
-            ]
+            for param, grads_for_param in zip(params, zip(*meta_grads_accumulator)):
+                param.grad = _safe_mean(list(grads_for_param), param)
 
             router_reg = None
             step_router_info = None
@@ -1247,33 +1250,27 @@ def train_datarater(
                     if reg_terms:
                         router_reg = torch.stack(reg_terms).sum()
 
-            params = tuple(data_rater.parameters())
-            meta_outputs = list(tracked_weight_tensors)
-            meta_grad_outputs = list(mean_weight_grads)
             if router_reg is not None:
-                meta_outputs.append(router_reg)
-                meta_grad_outputs.append(torch.ones_like(router_reg))
-
-            if meta_outputs:
-                meta_grads = torch.autograd.grad(
-                    tuple(meta_outputs),
+                router_grads = torch.autograd.grad(
+                    router_reg,
                     params,
-                    grad_outputs=tuple(meta_grad_outputs),
                     allow_unused=True,
                 )
-            else:
-                meta_grads = tuple(None for _ in params)
-
-            for p, g in zip(params, meta_grads):
-                p.grad = torch.zeros_like(p) if g is None else g
+                for param, grad_value in zip(params, router_grads):
+                    if grad_value is None:
+                        continue
+                    if param.grad is None:
+                        param.grad = grad_value
+                    else:
+                        param.grad = param.grad + grad_value
 
             rater_opt.step()
 
             if (step + 1) % 50 == 0:
                 with torch.no_grad():
                     gsum = 0.0
-                    for p in data_rater.parameters():
-                        gsum += float(p.grad.norm().item()) if p.grad is not None else 0.0
+                    for param in data_rater.parameters():
+                        gsum += float(param.grad.norm().item()) if param.grad is not None else 0.0
                     outer_loss_value = (
                         sum(outer_loss_values) / float(len(outer_loss_values))
                         if outer_loss_values else 0.0
@@ -1284,19 +1281,18 @@ def train_datarater(
                     )
                     if batch_src_std is not None:
                         msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
-                    if datarater_arch == "moe":
-                        if step_router_info is not None:
-                            expert_counts = step_router_info["expert_counts"].detach().cpu().tolist()
-                            msg += (
-                                f" | router_aux={float(step_router_info['aux_loss'].detach().item()):.6f}"
-                                f" | router_z={float(step_router_info['z_loss'].detach().item()):.6f}"
-                                f" | router_entropy={float(step_router_info['router_entropy'].detach().item()):.6f}"
-                                f" | max_share={float(step_router_info['max_expert_share'].detach().item()):.4f}"
-                                f" | overflow={int(step_router_info['overflow_count'].detach().item())}"
-                                f" | dropped={int(step_router_info['dropped_tokens'].detach().item())}"
-                                f" | capacity={int(step_router_info['capacity'].detach().item())}"
-                                f" | expert_counts={expert_counts}"
-                            )
+                    if datarater_arch == "moe" and step_router_info is not None:
+                        expert_counts = step_router_info["expert_counts"].detach().cpu().tolist()
+                        msg += (
+                            f" | router_aux={float(step_router_info['aux_loss'].detach().item()):.6f}"
+                            f" | router_z={float(step_router_info['z_loss'].detach().item()):.6f}"
+                            f" | router_entropy={float(step_router_info['router_entropy'].detach().item()):.6f}"
+                            f" | max_share={float(step_router_info['max_expert_share'].detach().item()):.4f}"
+                            f" | overflow={int(step_router_info['overflow_count'].detach().item())}"
+                            f" | dropped={int(step_router_info['dropped_tokens'].detach().item())}"
+                            f" | capacity={int(step_router_info['capacity'].detach().item())}"
+                            f" | expert_counts={expert_counts}"
+                        )
                 logger.info(msg)
 
         return data_rater
