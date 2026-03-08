@@ -104,6 +104,10 @@ class MultiHeadDataRater(nn.Module):
         self.source_names = [str(s) for s in source_names]
         if not self.source_names:
             raise ValueError("MultiHeadDataRater requires at least one source name.")
+        self.source_to_head_key = {
+            src: f"source_{idx}"
+            for idx, src in enumerate(self.source_names)
+        }
 
         if force_eager_attn:
             self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
@@ -111,7 +115,7 @@ class MultiHeadDataRater(nn.Module):
             self.esm = EsmModel.from_pretrained(model_name)
 
         self.heads = nn.ModuleDict({
-            src: nn.Sequential(
+            self.source_to_head_key[src]: nn.Sequential(
                 nn.Linear(ESM_HIDDEN, 128),
                 nn.ReLU(),
                 nn.Linear(128, 1),
@@ -137,13 +141,14 @@ class MultiHeadDataRater(nn.Module):
         grouped: Dict[str, List[int]] = {}
         for idx, source_name in enumerate(sources):
             source_key = str(source_name)
-            if source_key not in self.heads:
+            head_key = self.source_to_head_key.get(source_key)
+            if head_key is None:
                 raise KeyError(f"Unknown source for MultiHeadDataRater: {source_key}")
-            grouped.setdefault(source_key, []).append(idx)
+            grouped.setdefault(head_key, []).append(idx)
 
-        for source_key, idxs in grouped.items():
+        for head_key, idxs in grouped.items():
             idx_t = torch.tensor(idxs, dtype=torch.long, device=pooled.device)
-            scores[idx_t] = self.heads[source_key](pooled[idx_t]).squeeze(-1)
+            scores[idx_t] = self.heads[head_key](pooled[idx_t]).squeeze(-1)
         return scores
 
     @torch.no_grad()
