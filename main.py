@@ -115,7 +115,7 @@ def parse_args():
     p.add_argument("--router_temperature", type=float, default=1.0,
                    help="Temperature applied to MoE router logits before softmax")
     p.add_argument("--moe_score_merge", type=str, default="weighted_sum",
-                   choices=["weighted_sum", "top1_only"],
+                   choices=["weighted_sum", "top1_only", "expert_level"],
                    help="How to merge MoE expert scores back to a scalar")
     p.add_argument("--drop_overflow_tokens", action=argparse.BooleanOptionalAction, default=True,
                    help="Whether MoE should drop overflowed expert assignments")
@@ -127,6 +127,9 @@ def parse_args():
                    help="Batch size B used strictly for P_accept formula calculation")
     p.add_argument("--keep_ratio", type=float, default=0.7,
                    help="Target keep ratio for filtering")
+    p.add_argument("--selection_mode", type=str, default="global",
+                   choices=["global", "per_expert"],
+                   help="Phase 4 filtering mode")
 
     # Phase 5: Retrain
     p.add_argument("--retrain_epochs", type=int, default=10,
@@ -397,7 +400,7 @@ def main():
 
     # Output dir with timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_prefix = f"p4_mixflow_{args.datarater_arch}_{args.outer_sampling}outer"
+    run_prefix = f"v5_{args.datarater_arch}_{args.outer_sampling}outer"
     run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
@@ -588,6 +591,7 @@ def main():
             N_ref=min(args.N_ref, len(train_dataset)),
             B=args.B,
             keep_ratio=args.keep_ratio,
+            selection_mode=args.selection_mode,
             save_dir=phase34_dir,
         )
 

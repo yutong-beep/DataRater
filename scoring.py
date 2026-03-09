@@ -18,7 +18,7 @@ from datasets import Dataset
 from scipy.stats import binom
 from tqdm import tqdm
 
-from model import datarater_forward
+from model import datarater_forward, extract_score_and_primary_expert
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +35,7 @@ def _to_jsonable(value):
 
 def save_scores_with_dataset(
     scores: np.ndarray,
+    expert_ids: np.ndarray,
     tokenized_dataset: Dataset,
     raw_dataset: Optional[Dataset],
     save_path: str,
@@ -55,6 +56,7 @@ def save_scores_with_dataset(
                 "tokenized_index": int(tokenized_idx),
                 "raw_index": raw_idx,
                 "score": float(score),
+                "primary_expert_id": int(expert_ids[tokenized_idx]),
             }
 
             if raw_dataset is not None and 0 <= raw_idx < len(raw_dataset):
@@ -70,16 +72,19 @@ def score_all_points(
     dataset: Dataset,
     raw_dataset: Optional[Dataset] = None,
     device: Optional[torch.device] = None,
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Score every data point in the dataset individually.
-    Returns array of raw scores, shape (N,).
+    Returns:
+        scores: array of scalar scores, shape (N,)
+        expert_ids: array of primary expert ids, shape (N,)
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     data_rater.eval()
     scores = []
+    expert_ids = []
 
     with torch.no_grad():
         for idx in tqdm(range(len(dataset)), desc="Scoring all points"):
@@ -88,16 +93,20 @@ def score_all_points(
             mask = sample["attention_mask"].unsqueeze(0).to(device)
             raw_idx_value = sample.get("raw_index", idx)
             raw_idx = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
-            score = datarater_forward(
+            raw_output = datarater_forward(
                 data_rater,
                 input_ids,
                 mask,
                 raw_indices=torch.tensor([raw_idx], dtype=torch.long, device=device),
                 raw_dataset=raw_dataset,
-            ).item()
-            scores.append(score)
+                return_router_info=True,
+            )
+            raw_scores, router_info = raw_output if isinstance(raw_output, tuple) else (raw_output, None)
+            score_tensor, primary_expert_id = extract_score_and_primary_expert(raw_scores, router_info)
+            scores.append(float(score_tensor.squeeze(0).item()))
+            expert_ids.append(int(primary_expert_id.squeeze(0).item()))
 
-    return np.array(scores)
+    return np.array(scores), np.array(expert_ids, dtype=np.int64)
 
 
 def build_cdf(scores: np.ndarray) -> np.ndarray:
@@ -134,6 +143,7 @@ def run_scoring_and_filtering(
     N_ref: int = 10000,
     B: int = 64,
     keep_ratio: float = 0.7,
+    selection_mode: str = "global",
     save_dir: str = "results/scoring",
 ) -> Tuple[Dataset, Dict]:
     """
@@ -155,12 +165,13 @@ def run_scoring_and_filtering(
     logger.info("=" * 60)
     logger.info(f"Dataset size: {len(train_dataset)}")
     logger.info(f"N_ref={N_ref}, B={B}, keep_ratio={keep_ratio}")
+    logger.info(f"selection_mode={selection_mode}")
 
     t0 = time.time()
 
     # ---- Phase 3: Score all points for analytics ----
     logger.info("Scoring all training points for analytics...")
-    all_scores = score_all_points(data_rater, train_dataset, raw_train_dataset, device)
+    all_scores, all_expert_ids = score_all_points(data_rater, train_dataset, raw_train_dataset, device)
 
     score_stats = {
         "mean": float(np.mean(all_scores)),
@@ -175,26 +186,71 @@ def run_scoring_and_filtering(
 
     # Save raw scores
     np.save(os.path.join(save_dir, "all_scores.npy"), all_scores)
+    np.save(os.path.join(save_dir, "all_expert_ids.npy"), all_expert_ids)
     scored_jsonl_path = os.path.join(save_dir, "all_scores_with_data.jsonl")
     save_scores_with_dataset(
         scores=all_scores,
+        expert_ids=all_expert_ids,
         tokenized_dataset=train_dataset,
         raw_dataset=raw_train_dataset,
         save_path=scored_jsonl_path,
     )
 
     # ---- Phase 4: Filter using model.filter_dataset (UNCHANGED) ----
-    logger.info("Running filter_dataset (model.py)...")
     from model import filter_dataset
-    filtered_dataset, kept_indices = filter_dataset(
-        data_rater=data_rater,
-        original_dataset=train_dataset,
-        raw_dataset=raw_train_dataset,
-        N_ref=min(N_ref, len(train_dataset)),
-        B=B,
-        keep_ratio=keep_ratio,
-        return_indices=True,
-    )
+    expert_filter_counts = {}
+    if selection_mode == "per_expert":
+        logger.info("Running per-expert filtering...")
+        kept_indices = []
+        unique_expert_ids = np.unique(all_expert_ids)
+        for expert_id in unique_expert_ids.tolist():
+            expert_mask = (all_expert_ids == expert_id)
+            expert_indices = np.where(expert_mask)[0].astype(np.int64)
+            if len(expert_indices) == 0:
+                continue
+            expert_subset = train_dataset.select(expert_indices.tolist())
+            _, local_kept_indices = filter_dataset(
+                data_rater=data_rater,
+                original_dataset=expert_subset,
+                raw_dataset=raw_train_dataset,
+                N_ref=min(N_ref, len(expert_subset)),
+                B=B,
+                keep_ratio=keep_ratio,
+                return_indices=True,
+            )
+            local_kept_indices_arr = np.array(local_kept_indices, dtype=np.int64)
+            global_kept_indices = expert_indices[local_kept_indices_arr] if len(local_kept_indices_arr) > 0 else np.array([], dtype=np.int64)
+            kept_indices.extend(global_kept_indices.tolist())
+            expert_filter_counts[str(int(expert_id))] = {
+                "original": int(len(expert_indices)),
+                "kept": int(len(global_kept_indices)),
+            }
+            logger.info(
+                "[Phase 4] Expert %d filtered: %d -> %d kept",
+                int(expert_id),
+                int(len(expert_indices)),
+                int(len(global_kept_indices)),
+            )
+
+        if expert_filter_counts:
+            logger.info(
+                "[Phase 4] Per-expert filtering keeps each expert on its own CDF, so low-volume experts are no longer suppressed by higher-scoring experts."
+            )
+
+        kept_indices = sorted(set(int(idx) for idx in kept_indices))
+        filtered_dataset = train_dataset.select(kept_indices)
+    else:
+        logger.info("Running global filter_dataset (model.py)...")
+        filtered_dataset, kept_indices = filter_dataset(
+            data_rater=data_rater,
+            original_dataset=train_dataset,
+            raw_dataset=raw_train_dataset,
+            N_ref=min(N_ref, len(train_dataset)),
+            B=B,
+            keep_ratio=keep_ratio,
+            return_indices=True,
+        )
+
     kept_indices_arr = np.array(kept_indices, dtype=np.int64)
     kept_indices_path = os.path.join(save_dir, "kept_indices.npy")
     np.save(kept_indices_path, kept_indices_arr)
@@ -222,6 +278,8 @@ def run_scoring_and_filtering(
         "B": B,
         "N_ref": N_ref,
         "score_stats": score_stats,
+        "selection_mode": selection_mode,
+        "expert_filter_counts": expert_filter_counts,
         "kept_source_proportions": kept_source_props,
         "keep_act": int(len(kept_indices_arr)),
         "kept_indices_path": kept_indices_path,

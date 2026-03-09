@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from transformers import EsmModel
 from torch.func import functional_call
 
-from mixflow_mg import mixflow_inner_update
+from mixflow_mg import compute_inner_weights, mixflow_inner_update
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +194,8 @@ class MoEDataRater(nn.Module):
             raise ValueError("capacity_factor must be positive.")
         if router_temperature <= 0.0:
             raise ValueError("router_temperature must be positive.")
-        if moe_score_merge not in {"weighted_sum", "top1_only"}:
-            raise ValueError("moe_score_merge must be one of {'weighted_sum', 'top1_only'}.")
+        if moe_score_merge not in {"weighted_sum", "top1_only", "expert_level"}:
+            raise ValueError("moe_score_merge must be one of {'weighted_sum', 'top1_only', 'expert_level'}.")
 
         self.model_name = model_name
         self.force_eager_attn = force_eager_attn
@@ -249,6 +249,7 @@ class MoEDataRater(nn.Module):
         router_probs = F.softmax(router_logits, dim=-1)
         topk_vals, topk_idx = torch.topk(router_probs, k=self.router_top_k, dim=-1)
         topk_weights = topk_vals / topk_vals.sum(dim=-1, keepdim=True).clamp(min=1e-9)
+        primary_expert_id = torch.argmax(router_probs, dim=-1)
 
         capacity = max(1, int(math.ceil(self.capacity_factor * batch_size * self.router_top_k / self.num_experts)))
         accepted_mask = torch.zeros((batch_size, self.router_top_k), dtype=torch.bool, device=device)
@@ -289,17 +290,33 @@ class MoEDataRater(nn.Module):
             route_scores[token_indices, route_positions] = expert_outputs
 
         accepted_weights = topk_weights * accepted_mask.to(topk_weights.dtype)
+        expert_scores = None
         if self.moe_score_merge == "weighted_sum":
             weight_denom = accepted_weights.sum(dim=-1, keepdim=True).clamp(min=1e-9)
             merge_weights = accepted_weights / weight_denom
             scores = torch.sum(merge_weights * route_scores, dim=-1)
-        else:
+        elif self.moe_score_merge == "top1_only":
             scores = torch.zeros(batch_size, dtype=dtype, device=device)
             taken = torch.zeros(batch_size, dtype=torch.bool, device=device)
             for route_pos in range(self.router_top_k):
                 route_mask = accepted_mask[:, route_pos] & (~taken)
                 scores[route_mask] = route_scores[route_mask, route_pos]
                 taken = taken | route_mask
+        else:
+            expert_scores = torch.full(
+                (batch_size, self.num_experts),
+                float("-inf"),
+                dtype=dtype,
+                device=device,
+            )
+            for route_pos in range(self.router_top_k):
+                route_values = route_scores[:, route_pos].masked_fill(~accepted_mask[:, route_pos], float("-inf"))
+                expert_scores = expert_scores.scatter(
+                    1,
+                    topk_idx[:, route_pos].unsqueeze(-1),
+                    route_values.unsqueeze(-1),
+                )
+            scores = torch.zeros(batch_size, dtype=dtype, device=device)
 
         importance = router_probs.mean(dim=0)
         total_routed = expert_counts.sum().to(dtype).clamp(min=1.0)
@@ -320,6 +337,8 @@ class MoEDataRater(nn.Module):
             "z_loss": z_loss,
             "max_expert_share": load.max().detach(),
             "capacity": torch.tensor(capacity, dtype=torch.long, device=device),
+            "expert_scores": expert_scores,
+            "primary_expert_id": primary_expert_id.detach(),
         }
 
         if return_router_info:
@@ -494,6 +513,30 @@ def datarater_forward(
     return scores
 
 
+def _split_datarater_output(output):
+    if isinstance(output, tuple):
+        if len(output) == 2:
+            return output[0], output[1]
+        raise ValueError("Unexpected datarater output tuple length.")
+    return output, None
+
+
+def extract_score_and_primary_expert(raw_scores, router_info=None):
+    if router_info is None or router_info.get("primary_expert_id") is None:
+        batch_size = int(raw_scores.size(0)) if torch.is_tensor(raw_scores) and raw_scores.ndim > 0 else 1
+        device = raw_scores.device if torch.is_tensor(raw_scores) else None
+        return raw_scores, torch.zeros(batch_size, dtype=torch.long, device=device)
+
+    primary_expert_id = router_info["primary_expert_id"].to(device=raw_scores.device)
+    expert_scores = router_info.get("expert_scores")
+    if expert_scores is None:
+        return raw_scores, primary_expert_id
+
+    primary_scores = expert_scores.gather(1, primary_expert_id.unsqueeze(-1)).squeeze(-1)
+    merged_scores = torch.where(torch.isfinite(primary_scores), primary_scores, raw_scores)
+    return merged_scores, primary_expert_id
+
+
 def functional_datarater_forward(
     data_rater: nn.Module,
     params: Dict[str, torch.Tensor],
@@ -501,13 +544,20 @@ def functional_datarater_forward(
     attention_mask: torch.Tensor,
     raw_indices=None,
     raw_dataset=None,
+    return_router_info: bool = False,
 ):
     if isinstance(data_rater, MultiHeadDataRater):
         batch_sources = _batch_sources_from_raw_indices(raw_indices, raw_dataset)
-        return functional_call(data_rater, params, (input_ids, attention_mask, batch_sources))
+        scores = functional_call(data_rater, params, (input_ids, attention_mask, batch_sources))
+        if return_router_info:
+            return scores, None
+        return scores
     if isinstance(data_rater, MoEDataRater):
-        return functional_call(data_rater, params, (input_ids, attention_mask))
-    return functional_call(data_rater, params, (input_ids, attention_mask))
+        return functional_call(data_rater, params, (input_ids, attention_mask, return_router_info))
+    scores = functional_call(data_rater, params, (input_ids, attention_mask))
+    if return_router_info:
+        return scores, None
+    return scores
 
 
 def _resolve_requested_sources(requested: Sequence[str], available: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -1162,14 +1212,16 @@ def train_datarater(
                         )
 
                     if inner_step_idx < T_warmup:
-                        raw_scores = datarater_forward(
+                        raw_output = datarater_forward(
                             data_rater,
                             input_ids,
                             mask,
                             raw_indices=raw_index,
                             raw_dataset=train_raw,
+                            return_router_info=(datarater_arch == "moe"),
                         )
-                        weights = F.softmax(raw_scores / tau, dim=0).detach()
+                        raw_scores, router_info = _split_datarater_output(raw_output)
+                        weights = compute_inner_weights(raw_scores, tau, router_info=router_info).detach()
                         preds = functional_forward(inner_model, fast_weights, input_ids, mask)
                         per = F.mse_loss(preds.float(), targets.float(), reduction="none")
                         inner_loss = torch.sum(weights.float() * per)
@@ -1334,13 +1386,17 @@ def filter_dataset(
             if raw_idx_value is not None:
                 raw_idx_int = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
                 raw_idx = torch.tensor([raw_idx_int], dtype=torch.long, device=device)
-            score = datarater_forward(
+            raw_output = datarater_forward(
                 data_rater,
                 input_ids,
                 mask,
                 raw_indices=raw_idx,
                 raw_dataset=raw_dataset,
-            ).item()
+                return_router_info=True,
+            )
+            raw_scores, router_info = _split_datarater_output(raw_output)
+            score_tensor, _ = extract_score_and_primary_expert(raw_scores, router_info)
+            score = float(score_tensor.squeeze(0).item())
             ref_scores.append(score)
 
     ref_scores.sort()
@@ -1359,13 +1415,17 @@ def filter_dataset(
                 raw_idx_int = int(raw_idx_value.item()) if torch.is_tensor(raw_idx_value) else int(raw_idx_value)
                 raw_idx = torch.tensor([raw_idx_int], dtype=torch.long, device=device)
 
-            score = datarater_forward(
+            raw_output = datarater_forward(
                 data_rater,
                 input_ids,
                 mask,
                 raw_indices=raw_idx,
                 raw_dataset=raw_dataset,
-            ).item()
+                return_router_info=True,
+            )
+            raw_scores, router_info = _split_datarater_output(raw_output)
+            score_tensor, _ = extract_score_and_primary_expert(raw_scores, router_info)
+            score = float(score_tensor.squeeze(0).item())
             pos = bisect.bisect_left(ref_scores, score)
             p = pos / max(1, len(ref_scores))
 

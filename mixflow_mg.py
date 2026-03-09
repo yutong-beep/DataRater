@@ -17,6 +17,39 @@ def _build_param_dict(keys, values):
     return {key: value for key, value in zip(keys, values)}
 
 
+def _split_datarater_output(output):
+    if isinstance(output, tuple):
+        if len(output) == 2:
+            return output[0], output[1]
+        raise ValueError("Unexpected datarater output tuple length.")
+    return output, None
+
+
+def compute_inner_weights(raw_scores, tau, router_info=None):
+    if router_info is not None and router_info.get("expert_scores") is not None:
+        expert_scores = router_info["expert_scores"]
+        batch_size = int(expert_scores.size(0))
+        final_weights = torch.zeros(batch_size, dtype=expert_scores.dtype, device=expert_scores.device)
+        for expert_idx in range(int(expert_scores.size(1))):
+            expert_column = expert_scores[:, expert_idx]
+            valid_mask = torch.isfinite(expert_column)
+            valid_indices = valid_mask.nonzero(as_tuple=False).squeeze(-1)
+            if valid_indices.numel() == 0:
+                continue
+            expert_weights = F.softmax(expert_column.index_select(0, valid_indices) / tau, dim=0)
+            final_weights = final_weights.index_add(0, valid_indices, expert_weights)
+
+        total_weight = final_weights.sum()
+        fallback = torch.full_like(final_weights, 1.0 / max(batch_size, 1))
+        return torch.where(
+            total_weight > 0,
+            final_weights / total_weight.clamp(min=1e-9),
+            fallback,
+        )
+
+    return F.softmax(raw_scores / tau, dim=0)
+
+
 class MixFlowMGInnerStep(torch.autograd.Function):
     """
     One inner SGD step with exact local Jacobian-vector products.
@@ -71,15 +104,17 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         rater_dict = _build_param_dict(rater_keys, rater_req)
 
         with torch.enable_grad():
-            raw_scores = functional_datarater_forward_fn(
+            raw_output = functional_datarater_forward_fn(
                 data_rater,
                 rater_dict,
                 input_ids,
                 attention_mask,
                 raw_indices=ctx.raw_indices,
                 raw_dataset=raw_dataset,
+                return_router_info=True,
             )
-            weights = F.softmax(raw_scores / tau, dim=0)
+            raw_scores, router_info = _split_datarater_output(raw_output)
+            weights = compute_inner_weights(raw_scores, tau, router_info=router_info)
 
             preds = functional_forward_fn(inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
@@ -116,15 +151,17 @@ class MixFlowMGInnerStep(torch.autograd.Function):
             fw_dict = _build_param_dict(ctx.fast_weight_keys, fw_tuple)
             rater_dict = _build_param_dict(ctx.rater_keys, r_tuple)
 
-            raw_scores = ctx.functional_datarater_forward_fn(
+            raw_output = ctx.functional_datarater_forward_fn(
                 ctx.data_rater,
                 rater_dict,
                 input_ids,
                 attention_mask,
                 raw_indices=raw_indices,
                 raw_dataset=ctx.raw_dataset,
+                return_router_info=True,
             )
-            weights = F.softmax(raw_scores / ctx.tau, dim=0)
+            raw_scores, router_info = _split_datarater_output(raw_output)
+            weights = compute_inner_weights(raw_scores, ctx.tau, router_info=router_info)
 
             preds = ctx.functional_forward_fn(ctx.inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
