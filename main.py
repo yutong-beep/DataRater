@@ -48,6 +48,10 @@ def parse_args():
                    help="Train a supervised DataRater from a completed Phase-1 sample-audit run, then exit")
     p.add_argument("--teacher_audit_run_dir", type=str, default=None,
                    help="Existing audit run directory used by --teacher_train_only")
+    p.add_argument("--teacher_downstream_only", action="store_true",
+                   help="Use a completed supervised teacher run to drive downstream retraining, then exit")
+    p.add_argument("--teacher_run_dir", type=str, default=None,
+                   help="Existing supervised teacher run directory used by --teacher_downstream_only")
 
     # Data
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
@@ -77,6 +81,9 @@ def parse_args():
                    help="Learning rate used by --teacher_train_only")
     p.add_argument("--teacher_val_frac", type=float, default=0.2,
                    help="Holdout fraction for supervised teacher training")
+    p.add_argument("--teacher_score_field", type=str, default="pred_prob_good",
+                   choices=["pred_prob_good", "pred_logit_good"],
+                   help="Teacher score column used by --teacher_downstream_only")
 
     # Phase 2: Meta-training
     p.add_argument("--meta_steps", type=int, default=5000,
@@ -507,6 +514,121 @@ def run_teacher_train_only(args):
     logger.info("Teacher-supervision pipeline complete!")
 
 
+def run_teacher_downstream_only(args):
+    if not args.teacher_run_dir:
+        raise ValueError("--teacher_run_dir is required when --teacher_downstream_only is set.")
+
+    teacher_results_path = os.path.join(args.teacher_run_dir, "results.json")
+    if not os.path.exists(teacher_results_path):
+        raise FileNotFoundError(f"Teacher run results not found: {teacher_results_path}")
+    teacher_results = json.load(open(teacher_results_path))
+    resolved = teacher_results.get("resolved_config", {})
+    if not resolved:
+        raise ValueError(f"Missing resolved_config in teacher run results: {teacher_results_path}")
+
+    dataset_name = str(resolved["dataset"])
+    data_mode = str(resolved["data_mode"])
+    train_ratio = float(resolved["train_ratio"])
+    seed = int(resolved["seed"])
+    max_length = int(resolved["max_length"])
+    batch_size = int(resolved["batch_size"])
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"p6_teacher_downstream_{args.phase5_strategy}"
+    run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    logger = setup_logging(run_dir)
+    logger.info("=" * 70)
+    logger.info("DataRater Teacher-Score Downstream Pipeline")
+    logger.info("=" * 70)
+    logger.info(f"Teacher run dir: {args.teacher_run_dir}")
+    logger.info(f"Run dir: {run_dir}")
+    logger.info(f"Args: {json.dumps(vars(args), indent=2)}")
+    logger.info(
+        "Resolved data config | dataset=%s | data_mode=%s | train_ratio=%.3f | seed=%d | max_length=%d | batch_size=%d",
+        dataset_name,
+        data_mode,
+        float(train_ratio),
+        int(seed),
+        int(max_length),
+        int(batch_size),
+    )
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+
+    from data_utils import prepare_data
+    from teacher_downstream import run_teacher_downstream
+
+    _, val_loader, train_dataset, val_dataset, train_raw_dataset, _ = prepare_data(
+        dataset_name=dataset_name,
+        max_length=max_length,
+        batch_size=batch_size,
+        train_ratio=train_ratio,
+        seed=seed,
+        mode=data_mode,
+    )
+    del val_loader
+
+    downstream_result = run_teacher_downstream(
+        teacher_run_dir=args.teacher_run_dir,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        train_raw_dataset=train_raw_dataset,
+        save_dir=os.path.join(run_dir, "teacher_downstream"),
+        batch_size=batch_size,
+        retrain_epochs=args.retrain_epochs,
+        lr=args.lr,
+        keep_ratio=args.keep_ratio,
+        phase5_strategy=args.phase5_strategy,
+        phase5_score_norm=args.phase5_score_norm,
+        phase5_min_weight=args.phase5_min_weight,
+        phase5_weight_power=args.phase5_weight_power,
+        random_mode=args.random_mode,
+        random_seed=args.random_seed,
+        device=device,
+        score_field=args.teacher_score_field,
+    )
+
+    def _sanitize(obj):
+        if isinstance(obj, (np.floating, np.integer)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize(v) for v in obj]
+        return obj
+
+    results = {
+        "teacher_run_dir": args.teacher_run_dir,
+        "resolved_config": resolved,
+        "teacher_downstream": downstream_result,
+    }
+    results_clean = _sanitize(results)
+    results_path = os.path.join(run_dir, "results.json")
+    with open(results_path, "w") as f:
+        json.dump(results_clean, f, indent=2)
+
+    logger.info(f"All results saved -> {results_path}")
+    logger.info(f"Run directory: {run_dir}")
+    logger.info("Teacher-downstream pipeline complete!")
+
+
 # ==========================================
 # Logging Setup
 # ==========================================
@@ -545,6 +667,9 @@ def main():
         return
     if args.teacher_train_only:
         run_teacher_train_only(args)
+        return
+    if args.teacher_downstream_only:
+        run_teacher_downstream_only(args)
         return
 
     # Parse phases
