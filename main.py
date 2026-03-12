@@ -78,7 +78,7 @@ def parse_args():
     p.add_argument("--temperature", type=float, default=0.5,
                    help="Softmax temperature tau used by DataRater in meta-training")
     p.add_argument("--outer_objective", type=str, default="mse_norm",
-                   choices=["mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"],
+                   choices=["mse", "rmse", "mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"],
                    help="Outer-loop objective for meta-training")
     p.add_argument("--alpha", type=float, default=0.5,
                    help="Mix coefficient for outer_objective='mix'")

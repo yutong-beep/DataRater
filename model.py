@@ -915,6 +915,10 @@ def _compute_outer_loss(
     mse_norm_eps: float,
     source_labels: Optional[List[str]] = None,
 ) -> torch.Tensor:
+    if objective == "mse":
+        return F.mse_loss(preds, targets)
+    if objective == "rmse":
+        return torch.sqrt(F.mse_loss(preds, targets) + outer_eps)
     if objective == "pearson":
         return _pearson_loss(preds, targets, outer_eps)
     if objective == "cosine":
@@ -996,7 +1000,7 @@ def train_datarater(
     try:
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        allowed_objectives = {"mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"}
+        allowed_objectives = {"mse", "rmse", "mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"}
         if outer_objective not in allowed_objectives:
             raise ValueError(f"outer_objective must be one of {sorted(allowed_objectives)}")
         if not (0.0 <= alpha <= 1.0):
