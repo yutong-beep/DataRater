@@ -44,6 +44,10 @@ def parse_args():
                    help="Run only random-baseline retrain for an existing run_dir, then exit")
     p.add_argument("--run_dir", type=str, default=None,
                    help="Existing run directory used by --random_only")
+    p.add_argument("--teacher_train_only", action="store_true",
+                   help="Train a supervised DataRater from a completed Phase-1 sample-audit run, then exit")
+    p.add_argument("--teacher_audit_run_dir", type=str, default=None,
+                   help="Existing audit run directory used by --teacher_train_only")
 
     # Data
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
@@ -64,6 +68,15 @@ def parse_args():
                    help="During Phase 1, run train-set eval after each epoch and export a teacher-signal cache")
     p.add_argument("--audit_top_frac", type=float, default=0.2,
                    help="Per-source top/bottom fraction used for teacher good/bad labels")
+    p.add_argument("--teacher_arch", type=str, default="multihead",
+                   choices=["single", "multihead", "moe"],
+                   help="Architecture used by --teacher_train_only")
+    p.add_argument("--teacher_epochs", type=int, default=10,
+                   help="Epochs used by --teacher_train_only")
+    p.add_argument("--teacher_lr", type=float, default=1e-4,
+                   help="Learning rate used by --teacher_train_only")
+    p.add_argument("--teacher_val_frac", type=float, default=0.2,
+                   help="Holdout fraction for supervised teacher training")
 
     # Phase 2: Meta-training
     p.add_argument("--meta_steps", type=int, default=5000,
@@ -369,6 +382,131 @@ def run_random_only(args):
     print(f"Updated: {results_path}")
 
 
+def run_teacher_train_only(args):
+    if not args.teacher_audit_run_dir:
+        raise ValueError("--teacher_audit_run_dir is required when --teacher_train_only is set.")
+
+    audit_run_dir = args.teacher_audit_run_dir
+    cfg_path = os.path.join(audit_run_dir, "config.json")
+    saved_cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+
+    dataset_name = _resolve_param("dataset", args.dataset, saved_cfg, "Bindwell/PPBA")
+    data_mode = _resolve_param("data_mode", args.data_mode, saved_cfg, "combined_train")
+    train_ratio = _resolve_param("train_ratio", args.train_ratio, saved_cfg, 0.8)
+    seed = _resolve_param("seed", args.seed, saved_cfg, 42)
+    max_length = _resolve_param("max_length", args.max_length, saved_cfg, 512)
+    batch_size = _resolve_param("batch_size", args.batch_size, saved_cfg, 64)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_prefix = f"p6_teacher_{args.teacher_arch}"
+    run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    logger = setup_logging(run_dir)
+    logger.info("=" * 70)
+    logger.info("DataRater Teacher-Supervision Pipeline")
+    logger.info("=" * 70)
+    logger.info(f"Audit run dir: {audit_run_dir}")
+    logger.info(f"Run dir: {run_dir}")
+    logger.info(f"Args: {json.dumps(vars(args), indent=2)}")
+    logger.info(
+        "Resolved data config | dataset=%s | data_mode=%s | train_ratio=%.3f | seed=%d | max_length=%d | batch_size=%d",
+        dataset_name,
+        data_mode,
+        float(train_ratio),
+        int(seed),
+        int(max_length),
+        int(batch_size),
+    )
+    with open(os.path.join(run_dir, "config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Device: {device}")
+
+    from data_utils import prepare_data
+    from teacher_trainer import train_teacher_datarater
+
+    _, _, train_dataset, _, train_raw_dataset, _ = prepare_data(
+        dataset_name=dataset_name,
+        max_length=max_length,
+        batch_size=batch_size,
+        train_ratio=train_ratio,
+        seed=seed,
+        mode=data_mode,
+    )
+
+    audit_parquet_path = os.path.join(
+        audit_run_dir,
+        "phase1_baseline",
+        "sample_audit",
+        "sample_audit.parquet",
+    )
+    teacher_dir = os.path.join(run_dir, "teacher_datarater")
+    teacher_result = train_teacher_datarater(
+        train_dataset=train_dataset,
+        raw_train_dataset=train_raw_dataset,
+        audit_parquet_path=audit_parquet_path,
+        save_dir=teacher_dir,
+        teacher_arch=args.teacher_arch,
+        epochs=args.teacher_epochs,
+        batch_size=batch_size,
+        lr=args.teacher_lr,
+        val_frac=args.teacher_val_frac,
+        seed=seed,
+        device=device,
+        num_experts=args.num_experts,
+        router_top_k=args.router_top_k,
+        capacity_factor=args.capacity_factor,
+        router_temperature=args.router_temperature,
+        router_noise_std=args.router_noise_std,
+        moe_score_merge=args.moe_score_merge,
+        drop_overflow_tokens=args.drop_overflow_tokens,
+    )
+
+    def _sanitize(obj):
+        if isinstance(obj, (np.floating, np.integer)):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {k: _sanitize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_sanitize(v) for v in obj]
+        return obj
+
+    results = {
+        "teacher_audit_run_dir": audit_run_dir,
+        "resolved_config": {
+            "dataset": dataset_name,
+            "data_mode": data_mode,
+            "train_ratio": float(train_ratio),
+            "seed": int(seed),
+            "max_length": int(max_length),
+            "batch_size": int(batch_size),
+        },
+        "teacher_supervised": teacher_result,
+    }
+    results_clean = _sanitize(results)
+    results_path = os.path.join(run_dir, "results.json")
+    with open(results_path, "w") as f:
+        json.dump(results_clean, f, indent=2)
+
+    logger.info(f"All results saved -> {results_path}")
+    logger.info(f"Run directory: {run_dir}")
+    logger.info("Teacher-supervision pipeline complete!")
+
+
 # ==========================================
 # Logging Setup
 # ==========================================
@@ -404,6 +542,9 @@ def main():
     args = parse_args()
     if args.random_only:
         run_random_only(args)
+        return
+    if args.teacher_train_only:
+        run_teacher_train_only(args)
         return
 
     # Parse phases
