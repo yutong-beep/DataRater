@@ -102,6 +102,7 @@ def train_baseline(
     device: Optional[torch.device] = None,
     model: Optional[nn.Module] = None,
     train_loader_factory: Optional[Callable[[int, int], DataLoader]] = None,
+    sample_auditor=None,
 ) -> Dict:
     """
     Standard supervised training.
@@ -198,6 +199,9 @@ def train_baseline(
         history["val_spearman"].append(val_metrics["spearman_r"])
         history["epoch_time"].append(elapsed)
 
+        if sample_auditor is not None:
+            sample_auditor.collect_epoch(model, epoch)
+
         # Best checkpoint
         if val_metrics["mse"] < best_val_mse:
             best_val_mse = val_metrics["mse"]
@@ -226,6 +230,10 @@ def train_baseline(
     with open(os.path.join(save_dir, f"{tag}_history.json"), "w") as f:
         json.dump(history, f, indent=2)
 
+    sample_audit_summary = None
+    if sample_auditor is not None:
+        sample_audit_summary = sample_auditor.finalize()
+
     return {
         "model": model,
         "history": history,
@@ -233,4 +241,5 @@ def train_baseline(
         "total_flops": total_flops,
         "total_steps": total_steps,
         "flops_per_step": flops_per_step,
+        "sample_audit": sample_audit_summary,
     }

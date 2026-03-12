@@ -60,6 +60,10 @@ def parse_args():
     # Phase 1 & 5: Baseline training
     p.add_argument("--epochs", type=int, default=10)
     p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--collect_sample_audit", action="store_true",
+                   help="During Phase 1, run train-set eval after each epoch and export a teacher-signal cache")
+    p.add_argument("--audit_top_frac", type=float, default=0.2,
+                   help="Per-source top/bottom fraction used for teacher good/bad labels")
 
     # Phase 2: Meta-training
     p.add_argument("--meta_steps", type=int, default=5000,
@@ -470,6 +474,19 @@ def main():
         from baseline_trainer import train_baseline
 
         phase1_dir = os.path.join(run_dir, "phase1_baseline")
+        sample_auditor = None
+        if args.collect_sample_audit:
+            from sample_audit import TrainDynamicsAuditor
+
+            sample_auditor = TrainDynamicsAuditor(
+                train_dataset=train_dataset,
+                raw_train_dataset=train_raw_dataset,
+                batch_size=args.batch_size,
+                device=device,
+                save_dir=os.path.join(phase1_dir, "sample_audit"),
+                top_frac=args.audit_top_frac,
+                tag="baseline",
+            )
         baseline_result = train_baseline(
             train_loader=train_loader,
             val_loader=val_loader,
@@ -478,6 +495,7 @@ def main():
             save_dir=phase1_dir,
             tag="baseline",
             device=device,
+            sample_auditor=sample_auditor,
         )
 
         results["baseline"] = {
@@ -485,6 +503,8 @@ def main():
             "total_flops": baseline_result["total_flops"],
             "history": baseline_result["history"],
         }
+        if baseline_result.get("sample_audit") is not None:
+            results["sample_audit"] = baseline_result["sample_audit"]
 
         # Plot training curves
         from viz import plot_training_curves

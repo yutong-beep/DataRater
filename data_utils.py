@@ -312,6 +312,36 @@ def tokenize_dataset(
 # ==========================================
 # DataLoader Factory
 # ==========================================
+def collate_tokenized_batch(batch):
+    input_ids = torch.stack([b["input_ids"] for b in batch])
+    attention_mask = torch.stack([b["attention_mask"] for b in batch])
+    affinity = torch.tensor([b["affinity"] for b in batch], dtype=torch.float32)
+    out = {"input_ids": input_ids, "attention_mask": attention_mask, "affinity": affinity}
+    if "raw_index" in batch[0]:
+        out["raw_index"] = torch.tensor([int(b["raw_index"]) for b in batch], dtype=torch.long)
+    return out
+
+
+def build_single_loader(
+    dataset: Dataset,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = 2,
+    shuffle: bool = False,
+    sampler: Optional[Sampler] = None,
+    drop_last: bool = False,
+) -> DataLoader:
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
+        num_workers=num_workers,
+        collate_fn=collate_tokenized_batch,
+        drop_last=drop_last,
+        pin_memory=True,
+    )
+
+
 def build_dataloaders(
     train_ds: Dataset,
     val_ds: Dataset,
@@ -323,14 +353,6 @@ def build_dataloaders(
     """
     Build DataLoaders with explicit collate function.
     """
-    def _collate(batch):
-        input_ids = torch.stack([b["input_ids"] for b in batch])
-        attention_mask = torch.stack([b["attention_mask"] for b in batch])
-        affinity = torch.tensor([b["affinity"] for b in batch], dtype=torch.float32)
-        out = {"input_ids": input_ids, "attention_mask": attention_mask, "affinity": affinity}
-        if "raw_index" in batch[0]:
-            out["raw_index"] = torch.tensor([int(b["raw_index"]) for b in batch], dtype=torch.long)
-        return out
 
     train_loader = DataLoader(
         train_ds,
@@ -338,7 +360,7 @@ def build_dataloaders(
         shuffle=shuffle_train if train_sampler is None else False,
         sampler=train_sampler,
         num_workers=num_workers,
-        collate_fn=_collate,
+        collate_fn=collate_tokenized_batch,
         drop_last=True,
         pin_memory=True,
     )
@@ -347,7 +369,7 @@ def build_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=_collate,
+        collate_fn=collate_tokenized_batch,
         drop_last=False,
         pin_memory=True,
     )
