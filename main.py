@@ -131,6 +131,16 @@ def parse_args():
     # Phase 5: Retrain
     p.add_argument("--retrain_epochs", type=int, default=10,
                    help="Epochs for retraining on filtered data")
+    p.add_argument("--phase5_strategy", type=str, default="filter",
+                   choices=["filter", "weighted_sampler", "curriculum_sampler"],
+                   help="Phase 5 retraining policy: hard-filter subset (default) or full-data score-driven sampling")
+    p.add_argument("--phase5_score_norm", type=str, default="source_rank",
+                   choices=["source_rank", "global_rank"],
+                   help="How frozen DataRater scores are normalized before Phase 5 score-driven sampling")
+    p.add_argument("--phase5_min_weight", type=float, default=0.1,
+                   help="Minimum per-sample weight added before Phase 5 weighted sampling")
+    p.add_argument("--phase5_weight_power", type=float, default=2.0,
+                   help="Exponent applied to normalized DataRater quality before Phase 5 weighted sampling")
     p.add_argument("--random_baseline", action="store_true",
                    help="Also run matched random baseline retrain in Phase 5")
     p.add_argument("--random_seed", type=int, default=42,
@@ -613,44 +623,86 @@ def main():
     # ==========================================
     # Phase 5: Retrain on Curated Data
     # ==========================================
-    if 5 in phases and filtered_dataset is not None:
+    if 5 in phases and (filtered_dataset is not None or args.phase5_strategy != "filter"):
         logger.info("\n" + "=" * 60)
-        logger.info(f"PHASE 5: Retrain on DataRater-Curated Data ({args.retrain_epochs} epochs)")
+        logger.info(
+            f"PHASE 5: Retrain with strategy='{args.phase5_strategy}' ({args.retrain_epochs} epochs)"
+        )
         logger.info("=" * 60)
 
         from data_utils import build_dataloaders
         from baseline_trainer import train_baseline
 
-        # Uses the standard base batch_size (64)
-        filtered_loader, _ = build_dataloaders(
-            filtered_dataset, val_dataset,
-            batch_size=args.batch_size,
-        )
+        retrain_train_loader = None
+        retrain_loader_factory = None
+        phase5_policy_info = None
+        phase5_train_size = None
+
+        if args.phase5_strategy == "filter":
+            if filtered_dataset is None:
+                raise ValueError("Phase 5 strategy 'filter' requires Phase 3+4 filtered_dataset.")
+            retrain_train_loader, _ = build_dataloaders(
+                filtered_dataset, val_dataset,
+                batch_size=args.batch_size,
+            )
+            phase5_train_size = len(filtered_dataset)
+        else:
+            phase34_dir = os.path.join(run_dir, "phase34_scoring")
+            scores_path = os.path.join(phase34_dir, "all_scores.npy")
+            if not os.path.exists(scores_path):
+                raise FileNotFoundError(
+                    f"Phase 5 strategy '{args.phase5_strategy}' requires scored training points: {scores_path}"
+                )
+
+            from phase5_policy import build_phase5_policy
+
+            all_scores = np.load(scores_path)
+            retrain_loader_factory, phase5_policy_info = build_phase5_policy(
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                raw_train_dataset=train_raw_dataset,
+                scores=all_scores,
+                batch_size=args.batch_size,
+                strategy=args.phase5_strategy,
+                score_norm=args.phase5_score_norm,
+                min_weight=args.phase5_min_weight,
+                weight_power=args.phase5_weight_power,
+            )
+            retrain_train_loader = retrain_loader_factory(1, args.retrain_epochs)
+            phase5_train_size = len(train_dataset)
+            logger.info("Phase 5 score-driven policy: %s", json.dumps(phase5_policy_info, indent=2))
 
         phase5_dir = os.path.join(run_dir, "phase5_retrained")
         retrained_result = train_baseline(
-            train_loader=filtered_loader,
+            train_loader=retrain_train_loader,
             val_loader=val_loader,
             epochs=args.retrain_epochs,
             lr=args.lr,
             save_dir=phase5_dir,
             tag="retrained",
             device=device,
+            train_loader_factory=retrain_loader_factory,
         )
 
         results["retrained"] = {
             "best_metrics": retrained_result["best_metrics"],
             "total_flops": retrained_result["total_flops"],
             "history": retrained_result["history"],
-            "filtered_train_size": len(filtered_dataset),
+            "phase5_train_size": int(phase5_train_size),
         }
         results["retrained_datarater"] = {
-            "keep_ratio": float(args.keep_ratio),
-            "keep_act": int(len(filtered_dataset)),
+            "phase5_strategy": args.phase5_strategy,
             "metrics": retrained_result["best_metrics"],
         }
+        if args.phase5_strategy == "filter":
+            results["retrained_datarater"]["keep_ratio"] = float(args.keep_ratio)
+            results["retrained_datarater"]["keep_act"] = int(phase5_train_size)
+        else:
+            results["retrained_datarater"]["phase5_train_size"] = int(phase5_train_size)
+        if phase5_policy_info is not None:
+            results["retrained_datarater"]["policy"] = phase5_policy_info
 
-        if args.random_baseline:
+        if args.random_baseline and args.phase5_strategy == "filter":
             phase34_dir = os.path.join(run_dir, "phase34_scoring")
             kept_indices_path = os.path.join(phase34_dir, "kept_indices.npy")
             if not os.path.exists(kept_indices_path):
@@ -701,12 +753,17 @@ def main():
                 "keep_act": keep_act,
                 "metrics": random_result["best_metrics"],
             }
+        elif args.random_baseline and args.phase5_strategy != "filter":
+            logger.info(
+                "Skipping extra random baseline for phase5_strategy='%s'; Phase 1 already provides the uniform full-data control.",
+                args.phase5_strategy,
+            )
 
         # Plot retraining curves
         from viz import plot_training_curves
         plot_training_curves(
             retrained_result["history"],
-            title="Phase 5: Retrained on Curated Data",
+            title=f"Phase 5: Retrained with {args.phase5_strategy}",
             save_path=os.path.join(run_dir, "plots", "phase5_curves.png"),
         )
 
@@ -755,7 +812,7 @@ def main():
             logger.info(f"{'perf_per_flop':<20} {ppf_b:>12.2e} {ppf_r:>12.2e} {ppf_r - ppf_b:>+12.2e}")
             logger.info("=" * 60)
 
-    elif 5 in phases and filtered_dataset is None:
+    elif 5 in phases and filtered_dataset is None and args.phase5_strategy == "filter":
         logger.warning("Skipping Phase 5: No filtered dataset available.")
 
     # ==========================================

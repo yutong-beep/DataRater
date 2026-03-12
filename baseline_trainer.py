@@ -9,7 +9,7 @@ import os
 import time
 import json
 import logging
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,7 @@ def train_baseline(
     tag: str = "baseline",
     device: Optional[torch.device] = None,
     model: Optional[nn.Module] = None,
+    train_loader_factory: Optional[Callable[[int, int], DataLoader]] = None,
 ) -> Dict:
     """
     Standard supervised training.
@@ -129,7 +130,8 @@ def train_baseline(
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Estimate FLOPs
-    sample_batch = next(iter(train_loader))
+    sample_loader = train_loader_factory(1, epochs) if train_loader_factory is not None else train_loader
+    sample_batch = next(iter(sample_loader))
     seq_len = sample_batch["input_ids"].shape[1]
     bs = sample_batch["input_ids"].shape[0]
     flops_per_step = estimate_flops_per_step(model, bs, seq_len)
@@ -161,7 +163,8 @@ def train_baseline(
         n_batches = 0
         t0 = time.time()
 
-        pbar = tqdm(train_loader, desc=f"[{tag}] Epoch {epoch}/{epochs}", leave=False)
+        current_train_loader = train_loader_factory(epoch, epochs) if train_loader_factory is not None else train_loader
+        pbar = tqdm(current_train_loader, desc=f"[{tag}] Epoch {epoch}/{epochs}", leave=False)
         for batch in pbar:
             input_ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)

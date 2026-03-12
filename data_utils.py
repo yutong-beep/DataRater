@@ -9,7 +9,7 @@ from typing import Tuple, Optional, List, Dict
 
 import torch
 import pandas as pd
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from datasets import Dataset
 from transformers import AutoTokenizer
 from huggingface_hub import hf_hub_download
@@ -317,6 +317,8 @@ def build_dataloaders(
     val_ds: Dataset,
     batch_size: int = DEFAULT_BATCH_SIZE,
     num_workers: int = 2,
+    train_sampler: Optional[Sampler] = None,
+    shuffle_train: bool = True,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build DataLoaders with explicit collate function.
@@ -333,7 +335,8 @@ def build_dataloaders(
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=shuffle_train if train_sampler is None else False,
+        sampler=train_sampler,
         num_workers=num_workers,
         collate_fn=_collate,
         drop_last=True,
