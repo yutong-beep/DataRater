@@ -19,7 +19,15 @@ from model import build_datarater_model, datarater_forward, infer_source_names
 
 logger = logging.getLogger(__name__)
 
-TEACHER_REGRESSION_FIELDS = {"teacher_goodness", "teacher_badness_rank", "teacher_badness"}
+TEACHER_GOODNESS_FIELDS = {"teacher_goodness"}
+TEACHER_BADNESS_FIELDS = {
+    "teacher_badness",
+    "teacher_badness_rank",
+    "teacher_noise_risk",
+    "teacher_noise_risk_rank",
+}
+TEACHER_AMBIGUITY_FIELDS = {"teacher_ambiguity", "teacher_ambiguity_rank"}
+TEACHER_REGRESSION_FIELDS = TEACHER_GOODNESS_FIELDS | TEACHER_BADNESS_FIELDS | TEACHER_AMBIGUITY_FIELDS
 
 
 def _finite_float(value, default: float = 0.0) -> float:
@@ -207,6 +215,7 @@ def _prepare_supervised_teacher_datasets(
         "teacher_badness_rank",
         "source",
     }
+    required_cols.add(regression_field)
     missing = required_cols.difference(audit_df.columns)
     if missing:
         raise ValueError(f"Teacher audit parquet missing columns: {sorted(missing)}")
@@ -216,6 +225,7 @@ def _prepare_supervised_teacher_datasets(
     goodness_full = np.full(n, np.nan, dtype=np.float32)
     badness_full = np.full(n, np.nan, dtype=np.float32)
     badness_rank_full = np.full(n, np.nan, dtype=np.float32)
+    target_selected_full = np.full(n, np.nan, dtype=np.float32)
 
     raw_indices = np.asarray(
         [int(v.item()) if torch.is_tensor(v) else int(v) for v in train_dataset["raw_index"]],
@@ -240,11 +250,13 @@ def _prepare_supervised_teacher_datasets(
         goodness_full[idx] = float(row.teacher_goodness)
         badness_full[idx] = float(row.teacher_badness)
         badness_rank_full[idx] = float(row.teacher_badness_rank)
+        target_selected_full[idx] = float(getattr(row, regression_field))
 
     target_lookup = {
         "teacher_goodness": goodness_full,
         "teacher_badness": badness_full,
         "teacher_badness_rank": badness_rank_full,
+        regression_field: target_selected_full,
     }
     target_full = target_lookup[regression_field]
 
@@ -472,9 +484,26 @@ def _score_all_train_samples(
     logits = np.concatenate(logits_all).astype(np.float32)
     probs = np.concatenate(probs_all).astype(np.float32)
 
-    predicts_goodness = target_mode == "binary_extremes" or regression_field == "teacher_goodness"
-    good_logits = logits if predicts_goodness else -logits
-    good_probs = probs if predicts_goodness else (1.0 - probs)
+    predicts_goodness = target_mode == "binary_extremes" or regression_field in TEACHER_GOODNESS_FIELDS
+    predicts_badness = regression_field in TEACHER_BADNESS_FIELDS
+    predicts_ambiguity = regression_field in TEACHER_AMBIGUITY_FIELDS
+    if predicts_goodness:
+        good_logits = logits
+        good_probs = probs
+        bad_probs = 1.0 - probs
+        ambiguity_probs = np.full_like(probs, np.nan, dtype=np.float32)
+    elif predicts_badness:
+        good_logits = -logits
+        good_probs = 1.0 - probs
+        bad_probs = probs
+        ambiguity_probs = np.full_like(probs, np.nan, dtype=np.float32)
+    elif predicts_ambiguity:
+        good_logits = np.full_like(logits, np.nan, dtype=np.float32)
+        good_probs = np.full_like(probs, np.nan, dtype=np.float32)
+        bad_probs = np.full_like(probs, np.nan, dtype=np.float32)
+        ambiguity_probs = probs
+    else:
+        raise ValueError(f"Unsupported regression_field for score export: {regression_field}")
 
     return pd.DataFrame(
         {
@@ -485,9 +514,11 @@ def _score_all_train_samples(
             "pred_sigmoid_score": probs,
             "pred_logit_good": good_logits.astype(np.float32),
             "pred_prob_good": good_probs.astype(np.float32),
-            "pred_prob_bad": (1.0 - good_probs).astype(np.float32),
+            "pred_prob_bad": bad_probs.astype(np.float32),
             "pred_teacher_goodness": good_probs.astype(np.float32),
-            "pred_teacher_badness": (1.0 - good_probs).astype(np.float32),
+            "pred_teacher_badness": bad_probs.astype(np.float32),
+            "pred_teacher_noise_risk": bad_probs.astype(np.float32),
+            "pred_teacher_ambiguity": ambiguity_probs.astype(np.float32),
         }
     )
 

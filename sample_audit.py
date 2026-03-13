@@ -40,6 +40,19 @@ def _within_source_ranks(values: np.ndarray, sources: List[str]) -> np.ndarray:
     return out
 
 
+def _epoch_slope(matrix: np.ndarray) -> np.ndarray:
+    if matrix.shape[0] <= 1:
+        return np.zeros(matrix.shape[1], dtype=np.float32)
+    t = np.arange(matrix.shape[0], dtype=np.float32)
+    t_centered = t - float(np.mean(t))
+    denom = float(np.sum(t_centered ** 2))
+    if denom <= 0.0:
+        return np.zeros(matrix.shape[1], dtype=np.float32)
+    y_centered = matrix - np.mean(matrix, axis=0, keepdims=True)
+    slope = np.sum(t_centered[:, None] * y_centered, axis=0) / denom
+    return slope.astype(np.float32)
+
+
 def _extract_sources(train_dataset, raw_train_dataset) -> List[str]:
     if raw_train_dataset is None or "source" not in getattr(raw_train_dataset, "column_names", []):
         return ["UNKNOWN"] * len(train_dataset)
@@ -185,6 +198,22 @@ class TrainDynamicsAuditor:
         final_pred = pred_matrix[-1]
         mean_pred = pred_matrix.mean(axis=0)
         loss_improvement = first_sq - final_sq
+        audit_epochs = int(sq_matrix.shape[0])
+        early_len = max(1, audit_epochs // 3)
+        late_len = max(1, audit_epochs // 3)
+        early_mean_sq = sq_matrix[:early_len].mean(axis=0)
+        late_mean_sq = sq_matrix[-late_len:].mean(axis=0)
+        sq_error_slope = _epoch_slope(sq_matrix)
+        pred_slope = _epoch_slope(pred_matrix)
+        if audit_epochs > 1:
+            sq_error_volatility = np.mean(np.abs(np.diff(sq_matrix, axis=0)), axis=0).astype(np.float32)
+            pred_volatility = np.mean(np.abs(np.diff(pred_matrix, axis=0)), axis=0).astype(np.float32)
+        else:
+            sq_error_volatility = np.zeros(len(self.train_dataset), dtype=np.float32)
+            pred_volatility = np.zeros(len(self.train_dataset), dtype=np.float32)
+        pred_std = pred_matrix.std(axis=0).astype(np.float32)
+        pred_drift = np.abs(pred_matrix[-1] - pred_matrix[0]).astype(np.float32)
+        improvement_ratio = ((early_mean_sq - late_mean_sq) / np.maximum(early_mean_sq, 1e-6)).astype(np.float32)
 
         rank_mean_sq = _within_source_ranks(mean_sq, self.sources)
         rank_final_sq = _within_source_ranks(final_sq, self.sources)
@@ -192,8 +221,30 @@ class TrainDynamicsAuditor:
         teacher_badness = (0.5 * rank_mean_sq) + (0.3 * rank_final_sq) + (0.2 * rank_std_sq)
         teacher_badness_rank = _within_source_ranks(teacher_badness, self.sources)
         teacher_goodness = 1.0 - teacher_badness_rank
+        rank_late_mean_sq = _within_source_ranks(late_mean_sq, self.sources)
+        rank_sq_error_volatility = _within_source_ranks(sq_error_volatility, self.sources)
+        rank_pred_std = _within_source_ranks(pred_std, self.sources)
+        rank_improvement_ratio = _within_source_ranks(improvement_ratio, self.sources)
+        mid_difficulty = 1.0 - np.abs((2.0 * rank_late_mean_sq) - 1.0)
+        teacher_noise_risk = (
+            (0.40 * rank_late_mean_sq)
+            + (0.20 * rank_final_sq)
+            + (0.15 * rank_sq_error_volatility)
+            + (0.15 * rank_pred_std)
+            + (0.10 * (1.0 - rank_improvement_ratio))
+        ).astype(np.float32)
+        teacher_noise_risk_rank = _within_source_ranks(teacher_noise_risk, self.sources)
+        teacher_ambiguity = (
+            (0.35 * rank_pred_std)
+            + (0.25 * rank_sq_error_volatility)
+            + (0.20 * mid_difficulty)
+            + (0.20 * rank_improvement_ratio)
+        ).astype(np.float32)
+        teacher_ambiguity_rank = _within_source_ranks(teacher_ambiguity, self.sources)
         is_bad = teacher_badness_rank >= (1.0 - self.top_frac)
         is_good = teacher_badness_rank <= self.top_frac
+        is_noisy = teacher_noise_risk_rank >= (1.0 - self.top_frac)
+        is_ambiguous = teacher_ambiguity_rank >= (1.0 - self.top_frac)
 
         audit_df = pd.DataFrame(
             {
@@ -207,18 +258,37 @@ class TrainDynamicsAuditor:
                 "max_sq_error": max_sq.astype(np.float32),
                 "first_sq_error": first_sq.astype(np.float32),
                 "final_sq_error": final_sq.astype(np.float32),
+                "early_mean_sq_error": early_mean_sq.astype(np.float32),
+                "late_mean_sq_error": late_mean_sq.astype(np.float32),
                 "mean_abs_error": mean_abs.astype(np.float32),
+                "sq_error_volatility": sq_error_volatility.astype(np.float32),
+                "sq_error_slope": sq_error_slope.astype(np.float32),
                 "final_prediction": final_pred.astype(np.float32),
                 "mean_prediction": mean_pred.astype(np.float32),
+                "prediction_std": pred_std.astype(np.float32),
+                "prediction_drift": pred_drift.astype(np.float32),
+                "prediction_volatility": pred_volatility.astype(np.float32),
+                "prediction_slope": pred_slope.astype(np.float32),
                 "loss_improvement": loss_improvement.astype(np.float32),
+                "improvement_ratio": improvement_ratio.astype(np.float32),
                 "rank_mean_sq_error": rank_mean_sq.astype(np.float32),
                 "rank_final_sq_error": rank_final_sq.astype(np.float32),
                 "rank_std_sq_error": rank_std_sq.astype(np.float32),
+                "rank_late_mean_sq_error": rank_late_mean_sq.astype(np.float32),
+                "rank_sq_error_volatility": rank_sq_error_volatility.astype(np.float32),
+                "rank_prediction_std": rank_pred_std.astype(np.float32),
+                "rank_improvement_ratio": rank_improvement_ratio.astype(np.float32),
                 "teacher_badness": teacher_badness.astype(np.float32),
                 "teacher_badness_rank": teacher_badness_rank.astype(np.float32),
                 "teacher_goodness": teacher_goodness.astype(np.float32),
+                "teacher_noise_risk": teacher_noise_risk.astype(np.float32),
+                "teacher_noise_risk_rank": teacher_noise_risk_rank.astype(np.float32),
+                "teacher_ambiguity": teacher_ambiguity.astype(np.float32),
+                "teacher_ambiguity_rank": teacher_ambiguity_rank.astype(np.float32),
                 "teacher_label_bad": is_bad.astype(np.int8),
                 "teacher_label_good": is_good.astype(np.int8),
+                "teacher_label_noisy": is_noisy.astype(np.int8),
+                "teacher_label_ambiguous": is_ambiguous.astype(np.int8),
             }
         )
 
@@ -230,6 +300,8 @@ class TrainDynamicsAuditor:
                 "final_sq_error": float(src_df["final_sq_error"].mean()),
                 "teacher_bad_rate": float(src_df["teacher_label_bad"].mean()),
                 "teacher_good_rate": float(src_df["teacher_label_good"].mean()),
+                "teacher_noisy_rate": float(src_df["teacher_label_noisy"].mean()),
+                "teacher_ambiguous_rate": float(src_df["teacher_label_ambiguous"].mean()),
             }
 
         audit_path = os.path.join(self.save_dir, "sample_audit.parquet")
@@ -262,6 +334,8 @@ class TrainDynamicsAuditor:
                 "final_sq_error": float(audit_df["final_sq_error"].mean()),
                 "teacher_bad_rate": float(audit_df["teacher_label_bad"].mean()),
                 "teacher_good_rate": float(audit_df["teacher_label_good"].mean()),
+                "teacher_noisy_rate": float(audit_df["teacher_label_noisy"].mean()),
+                "teacher_ambiguous_rate": float(audit_df["teacher_label_ambiguous"].mean()),
             },
             "source_stats": source_stats,
         }

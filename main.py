@@ -85,7 +85,15 @@ def parse_args():
                    choices=["binary_extremes", "regression_all"],
                    help="Supervised teacher target: top/bottom binary labels or full-dataset continuous regression")
     p.add_argument("--teacher_regression_field", type=str, default="teacher_goodness",
-                   choices=["teacher_goodness", "teacher_badness_rank", "teacher_badness"],
+                   choices=[
+                       "teacher_goodness",
+                       "teacher_badness_rank",
+                       "teacher_badness",
+                       "teacher_noise_risk",
+                       "teacher_noise_risk_rank",
+                       "teacher_ambiguity",
+                       "teacher_ambiguity_rank",
+                   ],
                    help="Continuous teacher target used when --teacher_target_mode regression_all")
     p.add_argument("--teacher_score_field", type=str, default="pred_prob_good",
                    choices=[
@@ -93,6 +101,8 @@ def parse_args():
                        "pred_logit_good",
                        "pred_teacher_goodness",
                        "pred_teacher_badness",
+                       "pred_teacher_noise_risk",
+                       "pred_teacher_ambiguity",
                        "pred_sigmoid_score",
                        "pred_raw_score",
                    ],
