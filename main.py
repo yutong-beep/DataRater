@@ -81,8 +81,21 @@ def parse_args():
                    help="Learning rate used by --teacher_train_only")
     p.add_argument("--teacher_val_frac", type=float, default=0.2,
                    help="Holdout fraction for supervised teacher training")
+    p.add_argument("--teacher_target_mode", type=str, default="binary_extremes",
+                   choices=["binary_extremes", "regression_all"],
+                   help="Supervised teacher target: top/bottom binary labels or full-dataset continuous regression")
+    p.add_argument("--teacher_regression_field", type=str, default="teacher_goodness",
+                   choices=["teacher_goodness", "teacher_badness_rank", "teacher_badness"],
+                   help="Continuous teacher target used when --teacher_target_mode regression_all")
     p.add_argument("--teacher_score_field", type=str, default="pred_prob_good",
-                   choices=["pred_prob_good", "pred_logit_good"],
+                   choices=[
+                       "pred_prob_good",
+                       "pred_logit_good",
+                       "pred_teacher_goodness",
+                       "pred_teacher_badness",
+                       "pred_sigmoid_score",
+                       "pred_raw_score",
+                   ],
                    help="Teacher score column used by --teacher_downstream_only")
 
     # Phase 2: Meta-training
@@ -479,6 +492,8 @@ def run_teacher_train_only(args):
         router_noise_std=args.router_noise_std,
         moe_score_merge=args.moe_score_merge,
         drop_overflow_tokens=args.drop_overflow_tokens,
+        target_mode=args.teacher_target_mode,
+        regression_field=args.teacher_regression_field,
     )
 
     def _sanitize(obj):
@@ -501,6 +516,14 @@ def run_teacher_train_only(args):
             "seed": int(seed),
             "max_length": int(max_length),
             "batch_size": int(batch_size),
+        },
+        "teacher_config": {
+            "teacher_target_mode": args.teacher_target_mode,
+            "teacher_regression_field": args.teacher_regression_field,
+            "teacher_arch": args.teacher_arch,
+            "teacher_epochs": int(args.teacher_epochs),
+            "teacher_lr": float(args.teacher_lr),
+            "teacher_val_frac": float(args.teacher_val_frac),
         },
         "teacher_supervised": teacher_result,
     }
