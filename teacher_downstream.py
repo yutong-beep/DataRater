@@ -89,6 +89,48 @@ def _sample_random_indices(
     return out, {"mode": mode}
 
 
+def _randomize_scores_for_policy(
+    scores: np.ndarray,
+    sources: list,
+    score_norm: str,
+    mode: str,
+    seed: int,
+):
+    rng = np.random.default_rng(seed)
+    randomized = np.asarray(scores, dtype=np.float64).copy()
+    src_arr = np.asarray(sources, dtype=object)
+
+    if mode == "uniform":
+        return None, {
+            "mode_requested": mode,
+            "mode_used": "baseline_ref",
+            "reason": "Uniform full-data baseline is already available from the audit run.",
+        }
+
+    if mode not in {"matched_source_counts", "stratified_ratio"}:
+        raise ValueError(f"Unsupported random_mode for policy control: {mode}")
+
+    if score_norm == "source_rank":
+        for src in sorted(set(sources)):
+            src_idx = np.where(src_arr == src)[0]
+            src_scores = randomized[src_idx].copy()
+            rng.shuffle(src_scores)
+            randomized[src_idx] = src_scores
+        return randomized, {
+            "mode_requested": mode,
+            "mode_used": "within_source_score_shuffle",
+            "seed": int(seed),
+            "num_sources": int(len(set(sources))),
+        }
+
+    randomized = randomized[rng.permutation(len(randomized))]
+    return randomized, {
+        "mode_requested": mode,
+        "mode_used": "global_score_shuffle",
+        "seed": int(seed),
+    }
+
+
 def load_teacher_run_context(teacher_run_dir: str) -> Tuple[Dict, Dict]:
     results_path = os.path.join(teacher_run_dir, "results.json")
     if not os.path.exists(results_path):
@@ -219,6 +261,7 @@ def run_teacher_downstream(
             "metrics": random_result["best_metrics"],
         }
     else:
+        sources = _extract_sources_for_tokenized(train_dataset, train_raw_dataset)
         retrain_loader_factory, policy_info = build_phase5_policy(
             train_dataset=train_dataset,
             val_dataset=val_dataset,
@@ -247,6 +290,52 @@ def run_teacher_downstream(
             "history": retrained_result["history"],
             "policy": policy_info,
         }
+        random_scores, random_info = _randomize_scores_for_policy(
+            scores=scores,
+            sources=sources,
+            score_norm=phase5_score_norm,
+            mode=random_mode,
+            seed=int(random_seed),
+        )
+        if random_scores is None:
+            results["teacher_random"] = {
+                "mode": random_mode,
+                "seed": int(random_seed),
+                "info": random_info,
+                "metrics": baseline_ref.get("best_metrics", {}),
+                "source": "audit_baseline_ref",
+            }
+        else:
+            random_loader_factory, random_policy_info = build_phase5_policy(
+                train_dataset=train_dataset,
+                val_dataset=val_dataset,
+                raw_train_dataset=train_raw_dataset,
+                scores=random_scores,
+                batch_size=batch_size,
+                strategy=phase5_strategy,
+                score_norm=phase5_score_norm,
+                min_weight=phase5_min_weight,
+                weight_power=phase5_weight_power,
+            )
+            random_loader = random_loader_factory(1, retrain_epochs)
+            _, val_loader = build_dataloaders(train_dataset, val_dataset, batch_size=batch_size)
+            random_result = train_baseline(
+                train_loader=random_loader,
+                val_loader=val_loader,
+                epochs=retrain_epochs,
+                lr=lr,
+                save_dir=os.path.join(save_dir, "phase5_random_teacher"),
+                tag="teacher_random_policy",
+                device=device,
+                train_loader_factory=random_loader_factory,
+            )
+            results["teacher_random"] = {
+                "mode": random_mode,
+                "seed": int(random_seed),
+                "info": random_info,
+                "metrics": random_result["best_metrics"],
+                "policy": random_policy_info,
+            }
 
     with open(os.path.join(save_dir, "teacher_downstream_results.json"), "w") as f:
         json.dump(results, f, indent=2)
