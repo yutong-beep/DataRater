@@ -48,6 +48,8 @@ def parse_args():
                    help="Train a supervised DataRater from a completed Phase-1 sample-audit run, then exit")
     p.add_argument("--teacher_audit_run_dir", type=str, default=None,
                    help="Existing audit run directory used by --teacher_train_only")
+    p.add_argument("--teacher_rebuild_only", action="store_true",
+                   help="Rebuild teacher columns from an existing sample-audit cache, then exit")
     p.add_argument("--teacher_downstream_only", action="store_true",
                    help="Use a completed supervised teacher run to drive downstream retraining, then exit")
     p.add_argument("--teacher_run_dir", type=str, default=None,
@@ -121,6 +123,14 @@ def parse_args():
                        "pred_raw_score",
                    ],
                    help="Auxiliary teacher score column used by dual-head downstream policies")
+    p.add_argument("--teacher_badness_weights", type=str, default=None,
+                   help="Comma-separated feature=weight spec used to rebuild teacher_badness from audit features")
+    p.add_argument("--teacher_noise_weights", type=str, default=None,
+                   help="Comma-separated feature=weight spec used to rebuild teacher_noise_risk from audit features")
+    p.add_argument("--teacher_ambiguity_weights", type=str, default=None,
+                   help="Comma-separated feature=weight spec used to rebuild teacher_ambiguity from audit features")
+    p.add_argument("--teacher_rebuild_top_frac", type=float, default=None,
+                   help="Optional top fraction override when rebuilding teacher labels from an existing audit cache")
 
     # Phase 2: Meta-training
     p.add_argument("--meta_steps", type=int, default=5000,
@@ -573,6 +583,42 @@ def run_teacher_train_only(args):
     logger.info("Teacher-supervision pipeline complete!")
 
 
+def run_teacher_rebuild_only(args):
+    if not args.teacher_audit_run_dir:
+        raise ValueError("--teacher_audit_run_dir is required when --teacher_rebuild_only is set.")
+
+    source_audit_run_dir = args.teacher_audit_run_dir
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_prefix = "p7_teacher_rebuild"
+    run_dir = os.path.join(args.output_dir, f"{run_prefix}_{timestamp}")
+    os.makedirs(run_dir, exist_ok=True)
+
+    logger = setup_logging(run_dir)
+    logger.info("=" * 70)
+    logger.info("DataRater Teacher-Rebuild Pipeline")
+    logger.info("=" * 70)
+    logger.info(f"Source audit run dir: {source_audit_run_dir}")
+    logger.info(f"Run dir: {run_dir}")
+    logger.info(f"Args: {json.dumps(vars(args), indent=2)}")
+    with open(os.path.join(run_dir, "rebuild_config.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    from sample_audit import rebuild_teacher_cache
+
+    rebuild_result = rebuild_teacher_cache(
+        source_audit_run_dir=source_audit_run_dir,
+        rebuilt_run_dir=run_dir,
+        top_frac=args.teacher_rebuild_top_frac,
+        badness_weight_spec=args.teacher_badness_weights,
+        noise_weight_spec=args.teacher_noise_weights,
+        ambiguity_weight_spec=args.teacher_ambiguity_weights,
+    )
+
+    logger.info("Rebuilt teacher cache -> %s", rebuild_result["sample_audit_parquet"])
+    logger.info("All results saved -> %s", os.path.join(run_dir, "results.json"))
+    logger.info("Teacher-rebuild pipeline complete!")
+
+
 def run_teacher_downstream_only(args):
     if not args.teacher_run_dir:
         raise ValueError("--teacher_run_dir is required when --teacher_downstream_only is set.")
@@ -751,6 +797,9 @@ def main():
     if args.random_only:
         run_random_only(args)
         return
+    if args.teacher_rebuild_only:
+        run_teacher_rebuild_only(args)
+        return
     if args.teacher_train_only:
         run_teacher_train_only(args)
         return
@@ -838,6 +887,9 @@ def main():
                 save_dir=os.path.join(phase1_dir, "sample_audit"),
                 top_frac=args.audit_top_frac,
                 tag="baseline",
+                badness_weight_spec=args.teacher_badness_weights,
+                noise_weight_spec=args.teacher_noise_weights,
+                ambiguity_weight_spec=args.teacher_ambiguity_weights,
             )
         baseline_result = train_baseline(
             train_loader=train_loader,
