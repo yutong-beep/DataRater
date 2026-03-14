@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from collections import Counter
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -89,19 +89,21 @@ def _sample_random_indices(
     return out, {"mode": mode}
 
 
-def _randomize_scores_for_policy(
-    scores: np.ndarray,
+def _randomize_score_bundle_for_policy(
+    primary_scores: np.ndarray,
+    aux_scores: Optional[np.ndarray],
     sources: list,
     score_norm: str,
     mode: str,
     seed: int,
 ):
     rng = np.random.default_rng(seed)
-    randomized = np.asarray(scores, dtype=np.float64).copy()
+    randomized_primary = np.asarray(primary_scores, dtype=np.float64).copy()
+    randomized_aux = None if aux_scores is None else np.asarray(aux_scores, dtype=np.float64).copy()
     src_arr = np.asarray(sources, dtype=object)
 
     if mode == "uniform":
-        return None, {
+        return None, None, {
             "mode_requested": mode,
             "mode_used": "baseline_ref",
             "reason": "Uniform full-data baseline is already available from the audit run.",
@@ -113,22 +115,43 @@ def _randomize_scores_for_policy(
     if score_norm == "source_rank":
         for src in sorted(set(sources)):
             src_idx = np.where(src_arr == src)[0]
-            src_scores = randomized[src_idx].copy()
-            rng.shuffle(src_scores)
-            randomized[src_idx] = src_scores
-        return randomized, {
+            perm = rng.permutation(src_idx.size)
+            randomized_primary[src_idx] = randomized_primary[src_idx][perm]
+            if randomized_aux is not None:
+                randomized_aux[src_idx] = randomized_aux[src_idx][perm]
+        return randomized_primary, randomized_aux, {
             "mode_requested": mode,
             "mode_used": "within_source_score_shuffle",
             "seed": int(seed),
             "num_sources": int(len(set(sources))),
+            "bundle_shuffle": bool(randomized_aux is not None),
         }
 
-    randomized = randomized[rng.permutation(len(randomized))]
-    return randomized, {
+    perm = rng.permutation(len(randomized_primary))
+    randomized_primary = randomized_primary[perm]
+    if randomized_aux is not None:
+        randomized_aux = randomized_aux[perm]
+    return randomized_primary, randomized_aux, {
         "mode_requested": mode,
         "mode_used": "global_score_shuffle",
         "seed": int(seed),
+        "bundle_shuffle": bool(randomized_aux is not None),
     }
+
+
+def _assert_matching_resolved_config(primary_results: Dict, aux_results: Dict):
+    primary = primary_results.get("resolved_config", {})
+    aux = aux_results.get("resolved_config", {})
+    keys = ["dataset", "data_mode", "train_ratio", "seed", "max_length", "batch_size"]
+    mismatches = []
+    for key in keys:
+        if primary.get(key) != aux.get(key):
+            mismatches.append(f"{key}: primary={primary.get(key)} aux={aux.get(key)}")
+    if mismatches:
+        raise ValueError(
+            "Primary and auxiliary teacher runs do not share the same resolved data config: "
+            + "; ".join(mismatches)
+        )
 
 
 def load_teacher_run_context(teacher_run_dir: str) -> Tuple[Dict, Dict]:
@@ -177,6 +200,7 @@ def load_teacher_scores(teacher_run_dir: str, score_field: str) -> np.ndarray:
 
 def run_teacher_downstream(
     teacher_run_dir: str,
+    teacher_aux_run_dir: Optional[str],
     train_dataset,
     val_dataset,
     train_raw_dataset,
@@ -193,22 +217,43 @@ def run_teacher_downstream(
     random_seed: int,
     device: torch.device,
     score_field: str = "pred_prob_good",
+    aux_score_field: str = "pred_teacher_ambiguity",
+    dual_noise_end_frac: float = 0.35,
+    dual_ambiguity_start_frac: float = 0.2,
+    dual_ambiguity_peak_frac: float = 0.55,
+    dual_ambiguity_end_frac: float = 0.85,
+    dual_noise_strength: float = 1.0,
+    dual_ambiguity_strength: float = 1.0,
 ):
-    if phase5_strategy not in {"filter", "weighted_sampler", "curriculum_sampler"}:
+    if phase5_strategy not in {"filter", "weighted_sampler", "curriculum_sampler", "dual_curriculum_sampler"}:
         raise ValueError(f"Unsupported phase5_strategy for teacher downstream: {phase5_strategy}")
 
     teacher_results, audit_results = load_teacher_run_context(teacher_run_dir)
     scores = load_teacher_scores(teacher_run_dir, score_field=score_field)
     if len(scores) != len(train_dataset):
         raise ValueError(f"Teacher scores length {len(scores)} != train dataset length {len(train_dataset)}")
+    aux_scores = None
+    aux_teacher_results = None
+    if phase5_strategy == "dual_curriculum_sampler":
+        if not teacher_aux_run_dir:
+            raise ValueError("dual_curriculum_sampler requires teacher_aux_run_dir.")
+        aux_teacher_results, _ = load_teacher_run_context(teacher_aux_run_dir)
+        _assert_matching_resolved_config(teacher_results, aux_teacher_results)
+        aux_scores = load_teacher_scores(teacher_aux_run_dir, score_field=aux_score_field)
+        if len(aux_scores) != len(train_dataset):
+            raise ValueError(
+                f"Aux teacher scores length {len(aux_scores)} != train dataset length {len(train_dataset)}"
+            )
 
     os.makedirs(save_dir, exist_ok=True)
     baseline_ref = audit_results.get("baseline", {})
     results = {
         "teacher_run_dir": teacher_run_dir,
+        "teacher_aux_run_dir": teacher_aux_run_dir,
         "teacher_audit_run_dir": teacher_results.get("teacher_audit_run_dir"),
         "baseline_ref": baseline_ref,
         "score_field": score_field,
+        "aux_score_field": aux_score_field if teacher_aux_run_dir else None,
         "phase5_strategy": phase5_strategy,
     }
 
@@ -272,6 +317,14 @@ def run_teacher_downstream(
             score_norm=phase5_score_norm,
             min_weight=phase5_min_weight,
             weight_power=phase5_weight_power,
+            aux_scores=aux_scores,
+            aux_score_norm=phase5_score_norm,
+            dual_noise_end_frac=dual_noise_end_frac,
+            dual_ambiguity_start_frac=dual_ambiguity_start_frac,
+            dual_ambiguity_peak_frac=dual_ambiguity_peak_frac,
+            dual_ambiguity_end_frac=dual_ambiguity_end_frac,
+            dual_noise_strength=dual_noise_strength,
+            dual_ambiguity_strength=dual_ambiguity_strength,
         )
         retrain_loader = retrain_loader_factory(1, retrain_epochs)
         _, val_loader = build_dataloaders(train_dataset, val_dataset, batch_size=batch_size)
@@ -290,8 +343,9 @@ def run_teacher_downstream(
             "history": retrained_result["history"],
             "policy": policy_info,
         }
-        random_scores, random_info = _randomize_scores_for_policy(
-            scores=scores,
+        random_scores, random_aux_scores, random_info = _randomize_score_bundle_for_policy(
+            primary_scores=scores,
+            aux_scores=aux_scores,
             sources=sources,
             score_norm=phase5_score_norm,
             mode=random_mode,
@@ -316,6 +370,14 @@ def run_teacher_downstream(
                 score_norm=phase5_score_norm,
                 min_weight=phase5_min_weight,
                 weight_power=phase5_weight_power,
+                aux_scores=random_aux_scores,
+                aux_score_norm=phase5_score_norm,
+                dual_noise_end_frac=dual_noise_end_frac,
+                dual_ambiguity_start_frac=dual_ambiguity_start_frac,
+                dual_ambiguity_peak_frac=dual_ambiguity_peak_frac,
+                dual_ambiguity_end_frac=dual_ambiguity_end_frac,
+                dual_noise_strength=dual_noise_strength,
+                dual_ambiguity_strength=dual_ambiguity_strength,
             )
             random_loader = random_loader_factory(1, retrain_epochs)
             _, val_loader = build_dataloaders(train_dataset, val_dataset, batch_size=batch_size)

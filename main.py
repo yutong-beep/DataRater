@@ -52,6 +52,8 @@ def parse_args():
                    help="Use a completed supervised teacher run to drive downstream retraining, then exit")
     p.add_argument("--teacher_run_dir", type=str, default=None,
                    help="Existing supervised teacher run directory used by --teacher_downstream_only")
+    p.add_argument("--teacher_aux_run_dir", type=str, default=None,
+                   help="Optional second supervised teacher run directory used by dual-head downstream policies")
 
     # Data
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
@@ -107,6 +109,18 @@ def parse_args():
                        "pred_raw_score",
                    ],
                    help="Teacher score column used by --teacher_downstream_only")
+    p.add_argument("--teacher_aux_score_field", type=str, default="pred_teacher_ambiguity",
+                   choices=[
+                       "pred_prob_good",
+                       "pred_logit_good",
+                       "pred_teacher_goodness",
+                       "pred_teacher_badness",
+                       "pred_teacher_noise_risk",
+                       "pred_teacher_ambiguity",
+                       "pred_sigmoid_score",
+                       "pred_raw_score",
+                   ],
+                   help="Auxiliary teacher score column used by dual-head downstream policies")
 
     # Phase 2: Meta-training
     p.add_argument("--meta_steps", type=int, default=5000,
@@ -179,7 +193,7 @@ def parse_args():
     p.add_argument("--retrain_epochs", type=int, default=10,
                    help="Epochs for retraining on filtered data")
     p.add_argument("--phase5_strategy", type=str, default="filter",
-                   choices=["filter", "weighted_sampler", "curriculum_sampler"],
+                   choices=["filter", "weighted_sampler", "curriculum_sampler", "dual_curriculum_sampler"],
                    help="Phase 5 retraining policy: hard-filter subset (default) or full-data score-driven sampling")
     p.add_argument("--phase5_score_norm", type=str, default="source_rank",
                    choices=["source_rank", "global_rank"],
@@ -188,6 +202,18 @@ def parse_args():
                    help="Minimum per-sample weight added before Phase 5 weighted sampling")
     p.add_argument("--phase5_weight_power", type=float, default=2.0,
                    help="Exponent applied to normalized DataRater quality before Phase 5 weighted sampling")
+    p.add_argument("--phase5_dual_noise_end_frac", type=float, default=0.35,
+                   help="Fraction of training over which the dual-head policy suppresses high-noise samples")
+    p.add_argument("--phase5_dual_ambiguity_start_frac", type=float, default=0.2,
+                   help="Training fraction where ambiguity upweighting starts in dual-head curriculum")
+    p.add_argument("--phase5_dual_ambiguity_peak_frac", type=float, default=0.55,
+                   help="Training fraction where ambiguity upweighting peaks in dual-head curriculum")
+    p.add_argument("--phase5_dual_ambiguity_end_frac", type=float, default=0.85,
+                   help="Training fraction where ambiguity upweighting returns to zero")
+    p.add_argument("--phase5_dual_noise_strength", type=float, default=1.0,
+                   help="Multiplier on the early noise-suppression branch of dual-head curriculum")
+    p.add_argument("--phase5_dual_ambiguity_strength", type=float, default=1.0,
+                   help="Multiplier on the mid-training ambiguity branch of dual-head curriculum")
     p.add_argument("--random_baseline", action="store_true",
                    help="Also run matched random baseline retrain in Phase 5")
     p.add_argument("--random_seed", type=int, default=42,
@@ -550,6 +576,8 @@ def run_teacher_train_only(args):
 def run_teacher_downstream_only(args):
     if not args.teacher_run_dir:
         raise ValueError("--teacher_run_dir is required when --teacher_downstream_only is set.")
+    if args.phase5_strategy == "dual_curriculum_sampler" and not args.teacher_aux_run_dir:
+        raise ValueError("--teacher_aux_run_dir is required when --phase5_strategy dual_curriculum_sampler.")
 
     teacher_results_path = os.path.join(args.teacher_run_dir, "results.json")
     if not os.path.exists(teacher_results_path):
@@ -558,6 +586,20 @@ def run_teacher_downstream_only(args):
     resolved = teacher_results.get("resolved_config", {})
     if not resolved:
         raise ValueError(f"Missing resolved_config in teacher run results: {teacher_results_path}")
+
+    if args.teacher_aux_run_dir:
+        aux_results_path = os.path.join(args.teacher_aux_run_dir, "results.json")
+        if not os.path.exists(aux_results_path):
+            raise FileNotFoundError(f"Aux teacher run results not found: {aux_results_path}")
+        aux_results = json.load(open(aux_results_path))
+        aux_resolved = aux_results.get("resolved_config", {})
+        keys = ["dataset", "data_mode", "train_ratio", "seed", "max_length", "batch_size"]
+        mismatches = [k for k in keys if resolved.get(k) != aux_resolved.get(k)]
+        if mismatches:
+            raise ValueError(
+                "Primary/aux teacher resolved_config mismatch: "
+                + ", ".join(f"{k}={resolved.get(k)} vs {aux_resolved.get(k)}" for k in mismatches)
+            )
 
     dataset_name = str(resolved["dataset"])
     data_mode = str(resolved["data_mode"])
@@ -576,6 +618,8 @@ def run_teacher_downstream_only(args):
     logger.info("DataRater Teacher-Score Downstream Pipeline")
     logger.info("=" * 70)
     logger.info(f"Teacher run dir: {args.teacher_run_dir}")
+    if args.teacher_aux_run_dir:
+        logger.info(f"Teacher aux run dir: {args.teacher_aux_run_dir}")
     logger.info(f"Run dir: {run_dir}")
     logger.info(f"Args: {json.dumps(vars(args), indent=2)}")
     logger.info(
@@ -618,6 +662,7 @@ def run_teacher_downstream_only(args):
 
     downstream_result = run_teacher_downstream(
         teacher_run_dir=args.teacher_run_dir,
+        teacher_aux_run_dir=args.teacher_aux_run_dir,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
         train_raw_dataset=train_raw_dataset,
@@ -634,6 +679,13 @@ def run_teacher_downstream_only(args):
         random_seed=args.random_seed,
         device=device,
         score_field=args.teacher_score_field,
+        aux_score_field=args.teacher_aux_score_field,
+        dual_noise_end_frac=args.phase5_dual_noise_end_frac,
+        dual_ambiguity_start_frac=args.phase5_dual_ambiguity_start_frac,
+        dual_ambiguity_peak_frac=args.phase5_dual_ambiguity_peak_frac,
+        dual_ambiguity_end_frac=args.phase5_dual_ambiguity_end_frac,
+        dual_noise_strength=args.phase5_dual_noise_strength,
+        dual_ambiguity_strength=args.phase5_dual_ambiguity_strength,
     )
 
     def _sanitize(obj):
@@ -649,6 +701,7 @@ def run_teacher_downstream_only(args):
 
     results = {
         "teacher_run_dir": args.teacher_run_dir,
+        "teacher_aux_run_dir": args.teacher_aux_run_dir,
         "resolved_config": resolved,
         "teacher_downstream": downstream_result,
     }
@@ -966,6 +1019,11 @@ def main():
             )
             phase5_train_size = len(filtered_dataset)
         else:
+            if args.phase5_strategy == "dual_curriculum_sampler":
+                raise ValueError(
+                    "phase5_strategy='dual_curriculum_sampler' is only supported via "
+                    "--teacher_downstream_only with --teacher_run_dir and --teacher_aux_run_dir."
+                )
             phase34_dir = os.path.join(run_dir, "phase34_scoring")
             scores_path = os.path.join(phase34_dir, "all_scores.npy")
             if not os.path.exists(scores_path):
