@@ -19,11 +19,16 @@ import json
 import logging
 import os
 import random
+import sys
 from datetime import datetime
 from typing import Dict, List
 
 import numpy as np
 import torch
+
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 from data_utils import prepare_data
 from sample_audit import DEFAULT_TEACHER_FORMULAS, rebuild_teacher_cache
