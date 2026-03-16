@@ -161,6 +161,13 @@ def parse_args():
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
                    help="Sample 1 inner model per meta-step (Task f)")
+    p.add_argument("--inner_reset_strategy", type=str, default="random_init",
+                   choices=["random_init", "carryover", "checkpoint_bank"],
+                   help="How inner models are refreshed during meta-training")
+    p.add_argument("--inner_init_bank_dir", type=str, default=None,
+                   help="Directory containing pretrained inner-model checkpoints used by checkpoint-bank resets")
+    p.add_argument("--inner_init_bank_jitter", type=int, default=0,
+                   help="Neighbor radius when sampling from the inner-init checkpoint bank on reset")
     p.add_argument("--datarater_arch", type=str, default="single",
                    choices=["single", "multihead", "moe"],
                    help="DataRater architecture for Phase 2")
@@ -959,6 +966,9 @@ def main():
             mse_norm_eps=args.mse_norm_eps,
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
+            inner_reset_strategy=args.inner_reset_strategy,
+            inner_init_bank_dir=args.inner_init_bank_dir,
+            inner_init_bank_jitter=args.inner_init_bank_jitter,
             use_zscore_inner=args.use_zscore_inner,
             datarater_arch=args.datarater_arch,
             outer_sampling=args.outer_sampling,

@@ -53,6 +53,9 @@ def run_meta_training(
     router_temperature: float = 1.0,
     moe_score_merge: str = "weighted_sum",
     drop_overflow_tokens: bool = True,
+    inner_reset_strategy: str = "random_init",
+    inner_init_bank_dir: Optional[str] = None,
+    inner_init_bank_jitter: int = 0,
     save_dir: str = "checkpoints/datarater",
 ) -> Dict:
     """
@@ -93,6 +96,9 @@ def run_meta_training(
         "router_temperature": router_temperature,
         "moe_score_merge": moe_score_merge,
         "drop_overflow_tokens": drop_overflow_tokens,
+        "inner_reset_strategy": inner_reset_strategy,
+        "inner_init_bank_dir": inner_init_bank_dir,
+        "inner_init_bank_jitter": inner_init_bank_jitter,
     }
 
     logger.info("=" * 60)
@@ -136,6 +142,9 @@ def run_meta_training(
         router_temperature=router_temperature,
         moe_score_merge=moe_score_merge,
         drop_overflow_tokens=drop_overflow_tokens,
+        inner_reset_strategy=inner_reset_strategy,
+        inner_init_bank_dir=inner_init_bank_dir,
+        inner_init_bank_jitter=inner_init_bank_jitter,
     )
 
     elapsed = time.time() - t0

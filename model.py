@@ -1,5 +1,7 @@
 # model.py
+import json
 import math
+import os
 import random
 import logging
 from typing import Dict, List, Tuple, Optional, Sequence
@@ -24,6 +26,58 @@ def _mean_pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor) -> tor
     summed = torch.sum(hidden * mask, dim=1)
     denom = torch.clamp(mask.sum(dim=1), min=1e-9)
     return summed / denom
+
+
+def _load_inner_init_bank(bank_dir: str) -> List[Dict[str, object]]:
+    manifest_path = os.path.join(bank_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        manifest = json.load(open(manifest_path))
+        members = manifest.get("members", [])
+    else:
+        members = []
+        for entry in sorted(os.listdir(bank_dir)):
+            member_dir = os.path.join(bank_dir, entry)
+            final_ckpt = os.path.join(member_dir, "final.pt")
+            if os.path.isdir(member_dir) and os.path.exists(final_ckpt):
+                members.append(
+                    {
+                        "member_id": entry,
+                        "final_checkpoint": final_ckpt,
+                    }
+                )
+
+    if not members:
+        raise ValueError(f"No inner-init-bank members found in: {bank_dir}")
+
+    bank_states: List[Dict[str, object]] = []
+    for idx, member in enumerate(members):
+        ckpt_path = member.get("final_checkpoint")
+        if not ckpt_path or not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Inner-init-bank checkpoint missing: {ckpt_path}")
+        state_dict = torch.load(ckpt_path, map_location="cpu", weights_only=True)
+        bank_states.append(
+            {
+                "bank_index": int(idx),
+                "member_id": str(member.get("member_id", f"member_{idx:02d}")),
+                "epoch": int(member.get("epoch", -1)),
+                "seed": int(member.get("seed", -1)),
+                "checkpoint_path": ckpt_path,
+                "state_dict": state_dict,
+            }
+        )
+    return bank_states
+
+
+def _select_inner_bank_member(base_idx: int, bank_size: int, jitter: int) -> int:
+    if bank_size <= 0:
+        raise ValueError("bank_size must be positive.")
+    base_idx = int(base_idx) % int(bank_size)
+    jitter = max(0, int(jitter))
+    if jitter <= 0:
+        return base_idx
+    lo = max(0, base_idx - jitter)
+    hi = min(bank_size - 1, base_idx + jitter)
+    return int(random.randint(lo, hi))
 
 
 # =========================
@@ -935,6 +989,9 @@ def train_datarater(
     router_temperature: float = 1.0,
     moe_score_merge: str = "weighted_sum",
     drop_overflow_tokens: bool = True,
+    inner_reset_strategy: str = "random_init",
+    inner_init_bank_dir: Optional[str] = None,
+    inner_init_bank_jitter: int = 0,
 ) -> nn.Module:
     """
     Meta-learn DataRater weights for samples.
@@ -959,10 +1016,14 @@ def train_datarater(
             raise ValueError("datarater_arch must be one of {'single', 'multihead', 'moe'}.")
         if outer_sampling not in {"random", "balanced", "harder"}:
             raise ValueError("outer_sampling must be one of {'random', 'balanced', 'harder'}.")
+        if inner_reset_strategy not in {"random_init", "carryover", "checkpoint_bank"}:
+            raise ValueError("inner_reset_strategy must be one of {'random_init', 'carryover', 'checkpoint_bank'}.")
         if router_aux_loss_coef < 0.0:
             raise ValueError("router_aux_loss_coef must be non-negative.")
         if router_z_loss_coef < 0.0:
             raise ValueError("router_z_loss_coef must be non-negative.")
+        if inner_init_bank_jitter < 0:
+            raise ValueError("inner_init_bank_jitter must be non-negative.")
         if datarater_arch == "moe" and router_noise_std > 0.0:
             logger.warning(
                 "[meta] p4-mixflow forces router_noise_std from %.4f to 0.0 so MixFlow recomputation stays deterministic.",
@@ -974,12 +1035,13 @@ def train_datarater(
         T_backprop_eff = min(T_backprop, T_window)
         T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
         logger.info(
-            "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s",
+            "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s, inner_reset=%s",
             T_window,
             T_backprop_eff,
             T_warmup,
             datarater_arch,
             outer_sampling,
+            inner_reset_strategy,
         )
 
         src2std: Dict[str, float] = {}
@@ -1054,6 +1116,31 @@ def train_datarater(
             ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
             for _ in range(n_inner_models)
         ]
+        inner_bank_states: List[Dict[str, object]] = []
+        inner_bank_assignments: List[int] = [0 for _ in range(n_inner_models)]
+        if inner_reset_strategy == "checkpoint_bank":
+            if not inner_init_bank_dir:
+                raise ValueError("inner_init_bank_dir is required when inner_reset_strategy='checkpoint_bank'.")
+            inner_bank_states = _load_inner_init_bank(inner_init_bank_dir)
+            inner_bank_assignments = [int(i % len(inner_bank_states)) for i in range(n_inner_models)]
+            logger.info(
+                "[meta] loaded inner-init bank | dir=%s | members=%d | jitter=%d",
+                inner_init_bank_dir,
+                len(inner_bank_states),
+                int(inner_init_bank_jitter),
+            )
+            for i, inner_model in enumerate(population):
+                assigned_idx = inner_bank_assignments[i]
+                assigned_member = inner_bank_states[assigned_idx]
+                inner_model.load_state_dict(assigned_member["state_dict"], strict=True)
+                logger.info(
+                    "[meta] initial inner model %d <- bank[%d] member=%s epoch=%s seed=%s",
+                    i,
+                    assigned_idx,
+                    assigned_member["member_id"],
+                    assigned_member["epoch"],
+                    assigned_member["seed"],
+                )
 
         train_iter = iter(train_loader)
         val_iter = iter(val_loader)
@@ -1074,10 +1161,29 @@ def train_datarater(
 
         for step in range(n_meta_steps):
             # staggered resets
+            reset_events = []
             for i, inner_model in enumerate(population):
                 offset = (n_inner_models - 1 - i) * (lifetime // n_inner_models)
                 if step > 0 and (step + offset) % lifetime == 0:
-                    inner_model.reset_parameters()
+                    if inner_reset_strategy == "random_init":
+                        inner_model.reset_parameters()
+                        reset_events.append(f"inner[{i}]=random_init")
+                    elif inner_reset_strategy == "checkpoint_bank":
+                        base_bank_idx = inner_bank_assignments[i]
+                        chosen_bank_idx = _select_inner_bank_member(
+                            base_idx=base_bank_idx,
+                            bank_size=len(inner_bank_states),
+                            jitter=inner_init_bank_jitter,
+                        )
+                        chosen_member = inner_bank_states[chosen_bank_idx]
+                        inner_model.load_state_dict(chosen_member["state_dict"], strict=True)
+                        reset_events.append(
+                            f"inner[{i}]=bank[{chosen_bank_idx}]/{chosen_member['member_id']}"
+                        )
+                    else:
+                        reset_events.append(f"inner[{i}]=carryover")
+            if reset_events and (step + 1) % 50 != 0:
+                logger.info("[meta] step %d reset events | %s", step + 1, ";".join(reset_events))
 
             models_to_process = (
                 [random.randint(0, n_inner_models - 1)] if sample_one_inner else list(range(n_inner_models))
@@ -1297,6 +1403,8 @@ def train_datarater(
                             f" | capacity={int(step_router_info['capacity'].detach().item())}"
                             f" | expert_counts={expert_counts}"
                         )
+                    if reset_events:
+                        msg += " | resets=" + ";".join(reset_events)
                 logger.info(msg)
 
         return data_rater
