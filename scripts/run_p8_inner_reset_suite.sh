@@ -28,6 +28,21 @@ BANK_BASE_SEED="${BANK_BASE_SEED:-1000}"
 BANK_EPOCHS="${BANK_EPOCHS:-5,5,6,6,7,7,8,8}"
 BANK_JITTER="${BANK_JITTER:-1}"
 RANDOM_MODE="${RANDOM_MODE:-matched_source_counts}"
+SUITE_TAG="${SUITE_TAG:-}"
+
+sanitize_tag() {
+  local raw="$1"
+  raw="${raw//,/x}"
+  raw="${raw// /}"
+  raw="${raw//[^A-Za-z0-9._-]/_}"
+  printf "%s" "$raw"
+}
+
+BANK_TAG="$(sanitize_tag "$BANK_EPOCHS")"
+EXTRA_TAG=""
+if [[ -n "$SUITE_TAG" ]]; then
+  EXTRA_TAG="_$(sanitize_tag "$SUITE_TAG")"
+fi
 
 COMMON_ARGS=(
   --dataset "$DATASET"
@@ -54,7 +69,7 @@ COMMON_ARGS=(
   --random_mode "$RANDOM_MODE"
 )
 
-BANK_OUTPUT_ROOT="experiments/p8_inner_bank_mix_seed${SEED}"
+BANK_OUTPUT_ROOT="experiments/p8_inner_bank_mix_ep${EPOCHS}_bank${BANK_TAG}_seed${SEED}${EXTRA_TAG}"
 
 echo "==> Building mixed-epoch inner-init bank"
 "$PYTHON_BIN" scripts/build_inner_init_bank.py \
@@ -74,7 +89,7 @@ echo "==> Using bank dir: $BANK_DIR"
 run_one() {
   local name="$1"
   shift
-  local out_root="experiments/p8_single_${name}_bs${BATCH_SIZE}_metabs${META_BATCH_SIZE}_tau${TEMPERATURE}_B${B_VAL}_outer-${OUTER_OBJECTIVE}_T${T_WINDOW}_Tb${T_BACKPROP}_n${N_INNER_MODELS}_ms${META_STEPS}_seed${SEED}"
+  local out_root="experiments/p8_single_${name}_ep${EPOCHS}_rep${RETRAIN_EPOCHS}_bs${BATCH_SIZE}_metabs${META_BATCH_SIZE}_tau${TEMPERATURE}_B${B_VAL}_outer-${OUTER_OBJECTIVE}_T${T_WINDOW}_Tb${T_BACKPROP}_n${N_INNER_MODELS}_ms${META_STEPS}_seed${SEED}${EXTRA_TAG}"
   echo "==> Running $name"
   "$PYTHON_BIN" main.py "${COMMON_ARGS[@]}" --output_dir "$out_root" "$@"
 }
