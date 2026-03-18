@@ -19,6 +19,8 @@ logger = logging.getLogger(__name__)
 ESM_MODEL_NAME = "facebook/esm2_t6_8M_UR50D"
 ESM_HIDDEN = 320  # esm2_t6_8M hidden size
 DEFAULT_HARD_OUTER_SOURCES = ["SKEMPI v2.0", "PDBbind v2020"]
+VALID_ESM_ATTN_IMPLEMENTATIONS = {"auto", "sdpa", "flash_attention_2", "eager"}
+VALID_ESM_TORCH_DTYPES = {"auto", "float32", "float16", "bfloat16"}
 
 
 def _mean_pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -26,6 +28,48 @@ def _mean_pool_hidden(hidden: torch.Tensor, attention_mask: torch.Tensor) -> tor
     summed = torch.sum(hidden * mask, dim=1)
     denom = torch.clamp(mask.sum(dim=1), min=1e-9)
     return summed / denom
+
+
+def _resolve_esm_torch_dtype(dtype_name: Optional[str]):
+    if dtype_name is None:
+        return None
+    key = str(dtype_name).strip().lower()
+    if key in {"", "auto"}:
+        return None
+    if key == "float32":
+        return torch.float32
+    if key == "float16":
+        return torch.float16
+    if key == "bfloat16":
+        return torch.bfloat16
+    raise ValueError(f"Unsupported esm_torch_dtype: {dtype_name}")
+
+
+def _load_esm_backbone(
+    model_name: str,
+    force_eager_attn: bool = False,
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
+):
+    attn_impl = str(attn_implementation).strip().lower()
+    if attn_impl not in VALID_ESM_ATTN_IMPLEMENTATIONS:
+        raise ValueError(
+            f"attn_implementation must be one of {sorted(VALID_ESM_ATTN_IMPLEMENTATIONS)}, got {attn_implementation}"
+        )
+    if force_eager_attn:
+        if attn_impl not in {"auto", "eager"}:
+            raise ValueError("force_eager_attn=True conflicts with explicit attn_implementation != eager/auto.")
+        attn_impl = "eager"
+
+    kwargs = {}
+    if attn_impl != "auto":
+        kwargs["attn_implementation"] = attn_impl
+
+    torch_dtype = _resolve_esm_torch_dtype(esm_torch_dtype)
+    if torch_dtype is not None:
+        kwargs["torch_dtype"] = torch_dtype
+
+    return EsmModel.from_pretrained(model_name, **kwargs)
 
 
 def _load_inner_init_bank(bank_dir: str) -> List[Dict[str, object]]:
@@ -94,17 +138,22 @@ class ESMForAffinity(nn.Module):
         model_name: str = ESM_MODEL_NAME,
         cache_init_state: bool = True,
         force_eager_attn: bool = False,
+        attn_implementation: str = "auto",
+        esm_torch_dtype: str = "auto",
     ):
         super().__init__()
         self.model_name = model_name
         self.force_eager_attn = force_eager_attn
+        self.attn_implementation = str(attn_implementation)
+        self.esm_torch_dtype = str(esm_torch_dtype)
 
         # Load once (HF caches locally after first download).
-        if force_eager_attn:
-            # Hard-disable SDPA/flash path at the transformers level.
-            self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
-        else:
-            self.esm = EsmModel.from_pretrained(model_name)
+        self.esm = _load_esm_backbone(
+            model_name=model_name,
+            force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
+        )
 
         self.mlp = nn.Sequential(
             nn.Linear(ESM_HIDDEN, 128),
@@ -153,10 +202,14 @@ class MultiHeadDataRater(nn.Module):
         model_name: str = ESM_MODEL_NAME,
         cache_init_state: bool = True,
         force_eager_attn: bool = False,
+        attn_implementation: str = "auto",
+        esm_torch_dtype: str = "auto",
     ):
         super().__init__()
         self.model_name = model_name
         self.force_eager_attn = force_eager_attn
+        self.attn_implementation = str(attn_implementation)
+        self.esm_torch_dtype = str(esm_torch_dtype)
         self.source_names = [str(s) for s in source_names]
         if not self.source_names:
             raise ValueError("MultiHeadDataRater requires at least one source name.")
@@ -165,10 +218,12 @@ class MultiHeadDataRater(nn.Module):
             for idx, src in enumerate(self.source_names)
         }
 
-        if force_eager_attn:
-            self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
-        else:
-            self.esm = EsmModel.from_pretrained(model_name)
+        self.esm = _load_esm_backbone(
+            model_name=model_name,
+            force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
+        )
 
         self.heads = nn.ModuleDict({
             self.source_to_head_key[src]: nn.Sequential(
@@ -236,6 +291,8 @@ class MoEDataRater(nn.Module):
         drop_overflow_tokens: bool = True,
         cache_init_state: bool = True,
         force_eager_attn: bool = False,
+        attn_implementation: str = "auto",
+        esm_torch_dtype: str = "auto",
     ):
         super().__init__()
         if num_experts <= 0:
@@ -260,11 +317,15 @@ class MoEDataRater(nn.Module):
         self.router_noise_std = float(router_noise_std)
         self.moe_score_merge = str(moe_score_merge)
         self.drop_overflow_tokens = bool(drop_overflow_tokens)
+        self.attn_implementation = str(attn_implementation)
+        self.esm_torch_dtype = str(esm_torch_dtype)
 
-        if force_eager_attn:
-            self.esm = EsmModel.from_pretrained(model_name, attn_implementation="eager")
-        else:
-            self.esm = EsmModel.from_pretrained(model_name)
+        self.esm = _load_esm_backbone(
+            model_name=model_name,
+            force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
+        )
 
         self.router = nn.Linear(ESM_HIDDEN, self.num_experts)
         self.experts = nn.ModuleList([
@@ -451,6 +512,8 @@ def build_datarater_model(
     model_name: str = ESM_MODEL_NAME,
     cache_init_state: bool = True,
     force_eager_attn: bool = False,
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
     num_experts: int = 4,
     router_top_k: int = 2,
     capacity_factor: float = 1.25,
@@ -464,6 +527,8 @@ def build_datarater_model(
             model_name=model_name,
             cache_init_state=cache_init_state,
             force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
     if arch == "multihead":
         uniq_sources = []
@@ -478,6 +543,8 @@ def build_datarater_model(
             model_name=model_name,
             cache_init_state=cache_init_state,
             force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
     if arch == "moe":
         return MoEDataRater(
@@ -491,6 +558,8 @@ def build_datarater_model(
             drop_overflow_tokens=drop_overflow_tokens,
             cache_init_state=cache_init_state,
             force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
     raise ValueError(f"Unsupported datarater arch: {arch}")
 
@@ -975,6 +1044,8 @@ def train_datarater(
     val_raw=None,
     device: Optional[torch.device] = None,
     force_eager_attn: bool = False,  # set True if you still see SDPA issues
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
     use_zscore_inner: bool = False,
     datarater_arch: str = "single",
     outer_sampling: str = "random",
@@ -1101,6 +1172,8 @@ def train_datarater(
             source_names=source_names,
             cache_init_state=True,
             force_eager_attn=force_eager_attn,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
             num_experts=num_experts,
             router_top_k=router_top_k,
             capacity_factor=capacity_factor,
@@ -1113,7 +1186,12 @@ def train_datarater(
 
         # Inner population (heavy)
         population = [
-            ESMForAffinity(cache_init_state=True, force_eager_attn=force_eager_attn).to(device)
+            ESMForAffinity(
+                cache_init_state=True,
+                force_eager_attn=force_eager_attn,
+                attn_implementation=attn_implementation,
+                esm_torch_dtype=esm_torch_dtype,
+            ).to(device)
             for _ in range(n_inner_models)
         ]
         inner_bank_states: List[Dict[str, object]] = []

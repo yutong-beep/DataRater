@@ -30,6 +30,8 @@ BANK_JITTER="${BANK_JITTER:-1}"
 RANDOM_MODE="${RANDOM_MODE:-matched_source_counts}"
 SUITE_TAG="${SUITE_TAG:-}"
 EXCLUDE_SOURCES="${EXCLUDE_SOURCES:-}"
+ESM_ATTN_IMPLEMENTATION="${ESM_ATTN_IMPLEMENTATION:-auto}"
+ESM_TORCH_DTYPE="${ESM_TORCH_DTYPE:-auto}"
 
 sanitize_tag() {
   local raw="$1"
@@ -66,6 +68,8 @@ COMMON_ARGS=(
   --n_inner_models "$N_INNER_MODELS"
   --lifetime "$LIFETIME"
   --seed "$SEED"
+  --esm_attn_implementation "$ESM_ATTN_IMPLEMENTATION"
+  --esm_torch_dtype "$ESM_TORCH_DTYPE"
   --random_baseline
   --random_mode "$RANDOM_MODE"
 )
@@ -87,6 +91,8 @@ echo "==> Building mixed-epoch inner-init bank"
   --bank_epochs "$BANK_EPOCHS" \
   --max_length "$MAX_LENGTH" \
   --batch_size "$BATCH_SIZE" \
+  --esm_attn_implementation "$ESM_ATTN_IMPLEMENTATION" \
+  --esm_torch_dtype "$ESM_TORCH_DTYPE" \
   --output_dir "$BANK_OUTPUT_ROOT"
 
 BANK_DIR="$(ls -td "$BANK_OUTPUT_ROOT"/inner_init_bank_* | head -n 1)"

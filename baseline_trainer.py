@@ -103,6 +103,8 @@ def train_baseline(
     model: Optional[nn.Module] = None,
     train_loader_factory: Optional[Callable[[int, int], DataLoader]] = None,
     sample_auditor=None,
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
 ) -> Dict:
     """
     Standard supervised training.
@@ -124,7 +126,10 @@ def train_baseline(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if model is None:
-        model = ESMForAffinity().to(device)
+        model = ESMForAffinity(
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
+        ).to(device)
     else:
         model = model.to(device)
 

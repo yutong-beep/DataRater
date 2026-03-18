@@ -224,6 +224,8 @@ def run_teacher_downstream(
     dual_ambiguity_end_frac: float = 0.85,
     dual_noise_strength: float = 1.0,
     dual_ambiguity_strength: float = 1.0,
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
 ):
     if phase5_strategy not in {"filter", "weighted_sampler", "curriculum_sampler", "dual_curriculum_sampler"}:
         raise ValueError(f"Unsupported phase5_strategy for teacher downstream: {phase5_strategy}")
@@ -271,6 +273,8 @@ def run_teacher_downstream(
             save_dir=os.path.join(save_dir, "phase5_retrained_teacher"),
             tag="teacher_filter",
             device=device,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
 
         sources = _extract_sources_for_tokenized(train_dataset, train_raw_dataset)
@@ -292,6 +296,8 @@ def run_teacher_downstream(
             save_dir=os.path.join(save_dir, "phase5_random_teacher"),
             tag="teacher_random",
             device=device,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
         results["teacher_retrained"] = {
             "metrics": retrained_result["best_metrics"],
@@ -337,6 +343,8 @@ def run_teacher_downstream(
             tag="teacher_policy",
             device=device,
             train_loader_factory=retrain_loader_factory,
+            attn_implementation=attn_implementation,
+            esm_torch_dtype=esm_torch_dtype,
         )
         results["teacher_retrained"] = {
             "metrics": retrained_result["best_metrics"],
@@ -390,6 +398,8 @@ def run_teacher_downstream(
                 tag="teacher_random_policy",
                 device=device,
                 train_loader_factory=random_loader_factory,
+                attn_implementation=attn_implementation,
+                esm_torch_dtype=esm_torch_dtype,
             )
             results["teacher_random"] = {
                 "mode": random_mode,

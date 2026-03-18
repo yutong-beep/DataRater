@@ -45,6 +45,10 @@ def parse_args():
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
+    p.add_argument("--esm_attn_implementation", type=str, default="auto",
+                   choices=["auto", "sdpa", "flash_attention_2", "eager"])
+    p.add_argument("--esm_torch_dtype", type=str, default="auto",
+                   choices=["auto", "float32", "float16", "bfloat16"])
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--output_dir", type=str, required=True)
     return p.parse_args()
@@ -131,6 +135,8 @@ def main():
             save_dir=member_dir,
             tag=f"inner_bank_{member_idx:02d}",
             device=device,
+            attn_implementation=args.esm_attn_implementation,
+            esm_torch_dtype=args.esm_torch_dtype,
         )
         torch.save(result["model"].state_dict(), final_ckpt)
         member_results = {
@@ -160,6 +166,8 @@ def main():
             "lr": float(args.lr),
             "weight_decay": float(args.weight_decay),
             "max_grad_norm": float(args.max_grad_norm),
+            "esm_attn_implementation": str(args.esm_attn_implementation),
+            "esm_torch_dtype": str(args.esm_torch_dtype),
         },
         "members": members,
     }

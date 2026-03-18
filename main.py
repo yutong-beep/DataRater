@@ -65,6 +65,12 @@ def parse_args():
                    help="Comma-separated source names to exclude before splitting/tokenization")
     p.add_argument("--max_length", type=int, default=512,
                    help="Max sequence length for tokenization")
+    p.add_argument("--esm_attn_implementation", type=str, default="auto",
+                   choices=["auto", "sdpa", "flash_attention_2", "eager"],
+                   help="Transformers attention backend used when loading ESM")
+    p.add_argument("--esm_torch_dtype", type=str, default="auto",
+                   choices=["auto", "float32", "float16", "bfloat16"],
+                   help="torch_dtype used when loading ESM from pretrained")
     p.add_argument("--batch_size", type=int, default=64,
                    help="Batch size for Baseline and Retrain (Phase 1 & 5)")
     p.add_argument("--meta_batch_size", type=int, default=16,
@@ -435,6 +441,8 @@ def run_random_only(args):
         save_dir=phase5_random_dir,
         tag="random",
         device=torch.device(args.device) if args.device else torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        attn_implementation=args.esm_attn_implementation,
+        esm_torch_dtype=args.esm_torch_dtype,
     )
 
     random_block = {
@@ -553,6 +561,8 @@ def run_teacher_train_only(args):
         drop_overflow_tokens=args.drop_overflow_tokens,
         target_mode=args.teacher_target_mode,
         regression_field=args.teacher_regression_field,
+        attn_implementation=args.esm_attn_implementation,
+        esm_torch_dtype=args.esm_torch_dtype,
     )
 
     def _sanitize(obj):
@@ -748,6 +758,8 @@ def run_teacher_downstream_only(args):
         dual_ambiguity_end_frac=args.phase5_dual_ambiguity_end_frac,
         dual_noise_strength=args.phase5_dual_noise_strength,
         dual_ambiguity_strength=args.phase5_dual_ambiguity_strength,
+        attn_implementation=args.esm_attn_implementation,
+        esm_torch_dtype=args.esm_torch_dtype,
     )
 
     def _sanitize(obj):
@@ -917,6 +929,8 @@ def main():
             tag="baseline",
             device=device,
             sample_auditor=sample_auditor,
+            attn_implementation=args.esm_attn_implementation,
+            esm_torch_dtype=args.esm_torch_dtype,
         )
 
         results["baseline"] = {
@@ -993,6 +1007,8 @@ def main():
             router_temperature=args.router_temperature,
             moe_score_merge=args.moe_score_merge,
             drop_overflow_tokens=args.drop_overflow_tokens,
+            attn_implementation=args.esm_attn_implementation,
+            esm_torch_dtype=args.esm_torch_dtype,
             save_dir=phase2_dir,
         )
 
@@ -1012,6 +1028,8 @@ def main():
         data_rater = build_datarater_model(
             arch=args.datarater_arch,
             source_names=source_names,
+            attn_implementation=args.esm_attn_implementation,
+            esm_torch_dtype=args.esm_torch_dtype,
             num_experts=args.num_experts,
             router_top_k=args.router_top_k,
             capacity_factor=args.capacity_factor,
@@ -1131,6 +1149,8 @@ def main():
             tag="retrained",
             device=device,
             train_loader_factory=retrain_loader_factory,
+            attn_implementation=args.esm_attn_implementation,
+            esm_torch_dtype=args.esm_torch_dtype,
         )
 
         results["retrained"] = {
@@ -1195,6 +1215,8 @@ def main():
                 save_dir=phase5_random_dir,
                 tag="random",
                 device=device,
+                attn_implementation=args.esm_attn_implementation,
+                esm_torch_dtype=args.esm_torch_dtype,
             )
             results["retrained_random"] = {
                 "mode": args.random_mode,

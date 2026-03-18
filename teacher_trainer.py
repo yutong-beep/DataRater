@@ -544,6 +544,8 @@ def train_teacher_datarater(
     drop_overflow_tokens: bool = True,
     target_mode: str = "binary_extremes",
     regression_field: str = "teacher_goodness",
+    attn_implementation: str = "auto",
+    esm_torch_dtype: str = "auto",
 ):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -565,6 +567,8 @@ def train_teacher_datarater(
     model = build_datarater_model(
         arch=teacher_arch,
         source_names=source_names,
+        attn_implementation=attn_implementation,
+        esm_torch_dtype=esm_torch_dtype,
         num_experts=num_experts,
         router_top_k=router_top_k,
         capacity_factor=capacity_factor,
