@@ -29,6 +29,7 @@ BANK_EPOCHS="${BANK_EPOCHS:-5,5,6,6,7,7,8,8}"
 BANK_JITTER="${BANK_JITTER:-1}"
 RANDOM_MODE="${RANDOM_MODE:-matched_source_counts}"
 SUITE_TAG="${SUITE_TAG:-}"
+EXCLUDE_SOURCES="${EXCLUDE_SOURCES:-}"
 
 sanitize_tag() {
   local raw="$1"
@@ -69,12 +70,17 @@ COMMON_ARGS=(
   --random_mode "$RANDOM_MODE"
 )
 
+if [[ -n "$EXCLUDE_SOURCES" ]]; then
+  COMMON_ARGS+=(--exclude_sources "$EXCLUDE_SOURCES")
+fi
+
 BANK_OUTPUT_ROOT="experiments/p8_inner_bank_mix_ep${EPOCHS}_bank${BANK_TAG}_seed${SEED}${EXTRA_TAG}"
 
 echo "==> Building mixed-epoch inner-init bank"
 "$PYTHON_BIN" scripts/build_inner_init_bank.py \
   --dataset "$DATASET" \
   --data_mode "$DATA_MODE" \
+  --exclude_sources "$EXCLUDE_SOURCES" \
   --train_ratio "$TRAIN_RATIO" \
   --seed "$SEED" \
   --bank_base_seed "$BANK_BASE_SEED" \

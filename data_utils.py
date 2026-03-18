@@ -81,6 +81,7 @@ def download_and_split(
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
     mode: str = "combined_train",  # "combined_train" or "all" (excluding Combined_train)
+    exclude_sources: Optional[List[str]] = None,
 ) -> Tuple[Dataset, Dataset]:
     """
     Strictly load dataset via hf_hub_download + pandas parquet reading,
@@ -96,9 +97,13 @@ def download_and_split(
         raise ValueError("mode must be 'combined_train' or 'all'")
 
     files_to_load = ["Combined_train.parquet"] if mode == "combined_train" else list(ALL_MODE_FILES)
+    exclude_sources = sorted(set(str(src).strip() for src in (exclude_sources or []) if str(src).strip()))
+    if exclude_sources:
+        logger.info("Excluding sources: %s", exclude_sources)
 
     dfs: List[pd.DataFrame] = []
     per_file_counts: Dict[str, int] = {}
+    per_file_excluded: Dict[str, int] = {}
 
     for fn in files_to_load:
         logger.info(f"Downloading parquet: {fn}")
@@ -116,12 +121,21 @@ def download_and_split(
             # Keep multi-head/source-aware phase-2 runs working in combined_train mode.
             df = df.copy()
             df["source"] = fn.replace(".parquet", "")
+        excluded_rows = 0
+        if exclude_sources and "source" in df.columns:
+            before = len(df)
+            df = df[~df["source"].astype(str).isin(exclude_sources)].reset_index(drop=True)
+            excluded_rows = before - len(df)
         per_file_counts[fn] = len(df)
+        per_file_excluded[fn] = excluded_rows
         dfs.append(df)
 
     logger.info("Loaded parquet files:")
     for k, v in per_file_counts.items():
-        logger.info(f"  - {k}: {v} rows")
+        if per_file_excluded.get(k, 0) > 0:
+            logger.info(f"  - {k}: {v} rows (excluded {per_file_excluded[k]})")
+        else:
+            logger.info(f"  - {k}: {v} rows")
 
     full_df = pd.concat(dfs, ignore_index=True)
     if mode == "all":
@@ -387,6 +401,7 @@ def prepare_data(
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
     mode: str = "combined_train",  # "combined_train" or "all"
+    exclude_sources: Optional[List[str]] = None,
 ) -> Tuple[DataLoader, DataLoader, Dataset, Dataset, Dataset, Dataset]:
     """
     One-call: download -> split -> tokenize -> dataloaders.
@@ -399,6 +414,7 @@ def prepare_data(
         seed=seed,
         cache_dir=cache_dir,
         mode=mode,
+        exclude_sources=exclude_sources,
     )
     train_tok = tokenize_dataset(train_raw, max_length=max_length, model_name=ESM_MODEL_NAME)
     val_tok = tokenize_dataset(val_raw, max_length=max_length, model_name=ESM_MODEL_NAME)

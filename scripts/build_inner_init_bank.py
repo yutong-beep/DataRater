@@ -33,6 +33,8 @@ def parse_args():
     p = argparse.ArgumentParser(description="Build a checkpoint bank for inner-model warm starts")
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
     p.add_argument("--data_mode", type=str, default="all", choices=["combined_train", "all"])
+    p.add_argument("--exclude_sources", type=str, default="",
+                   help="Comma-separated source names to exclude before splitting/tokenization")
     p.add_argument("--train_ratio", type=float, default=0.8)
     p.add_argument("--seed", type=int, default=42, help="Data split seed")
     p.add_argument("--bank_base_seed", type=int, default=1000, help="Base seed for random bank members")
@@ -101,6 +103,7 @@ def main():
         train_ratio=args.train_ratio,
         seed=args.seed,
         mode=args.data_mode,
+        exclude_sources=[part.strip() for part in str(args.exclude_sources).split(",") if part.strip()],
     )
 
     members = []
@@ -148,6 +151,7 @@ def main():
         "resolved_config": {
             "dataset": args.dataset,
             "data_mode": args.data_mode,
+            "exclude_sources": [part.strip() for part in str(args.exclude_sources).split(",") if part.strip()],
             "train_ratio": float(args.train_ratio),
             "seed": int(args.seed),
             "bank_base_seed": int(args.bank_base_seed),

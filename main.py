@@ -61,6 +61,8 @@ def parse_args():
     p.add_argument("--dataset", type=str, default="Bindwell/PPBA")
     p.add_argument("--data_mode", type=str, default="combined_train", choices=["combined_train", "all"],
                    help="Dataset loading mode: 'combined_train' (default) or 'all'")
+    p.add_argument("--exclude_sources", type=str, default="",
+                   help="Comma-separated source names to exclude before splitting/tokenization")
     p.add_argument("--max_length", type=int, default=512,
                    help="Max sequence length for tokenization")
     p.add_argument("--batch_size", type=int, default=64,
@@ -355,6 +357,7 @@ def run_random_only(args):
 
     dataset_name = _resolve_param("dataset", args.dataset, saved_cfg, "Bindwell/PPBA")
     data_mode = _resolve_param("data_mode", args.data_mode, saved_cfg, "combined_train")
+    exclude_sources = _parse_csv_arg(_resolve_param("exclude_sources", args.exclude_sources, saved_cfg, ""))
     train_ratio = _resolve_param("train_ratio", args.train_ratio, saved_cfg, 0.8)
     seed = _resolve_param("seed", args.seed, saved_cfg, 42)
     max_length = _resolve_param("max_length", args.max_length, saved_cfg, 512)
@@ -369,6 +372,7 @@ def run_random_only(args):
         train_ratio=train_ratio,
         seed=seed,
         mode=data_mode,
+        exclude_sources=exclude_sources,
     )
 
     keep_ratio = float(existing_results.get("filtering", {}).get("target_keep_ratio", args.keep_ratio))
@@ -465,6 +469,7 @@ def run_teacher_train_only(args):
 
     dataset_name = _resolve_param("dataset", args.dataset, saved_cfg, "Bindwell/PPBA")
     data_mode = _resolve_param("data_mode", args.data_mode, saved_cfg, "combined_train")
+    exclude_sources = _parse_csv_arg(_resolve_param("exclude_sources", args.exclude_sources, saved_cfg, ""))
     train_ratio = _resolve_param("train_ratio", args.train_ratio, saved_cfg, 0.8)
     seed = _resolve_param("seed", args.seed, saved_cfg, 42)
     max_length = _resolve_param("max_length", args.max_length, saved_cfg, 512)
@@ -517,6 +522,7 @@ def run_teacher_train_only(args):
         train_ratio=train_ratio,
         seed=seed,
         mode=data_mode,
+        exclude_sources=exclude_sources,
     )
 
     audit_parquet_path = os.path.join(
@@ -569,6 +575,7 @@ def run_teacher_train_only(args):
             "seed": int(seed),
             "max_length": int(max_length),
             "batch_size": int(batch_size),
+            "exclude_sources": exclude_sources,
         },
         "teacher_config": {
             "teacher_target_mode": args.teacher_target_mode,
@@ -656,6 +663,7 @@ def run_teacher_downstream_only(args):
 
     dataset_name = str(resolved["dataset"])
     data_mode = str(resolved["data_mode"])
+    exclude_sources = [str(x) for x in resolved.get("exclude_sources", [])]
     train_ratio = float(resolved["train_ratio"])
     seed = int(resolved["seed"])
     max_length = int(resolved["max_length"])
@@ -710,6 +718,7 @@ def run_teacher_downstream_only(args):
         train_ratio=train_ratio,
         seed=seed,
         mode=data_mode,
+        exclude_sources=exclude_sources,
     )
     del val_loader
 
@@ -867,6 +876,7 @@ def main():
         train_ratio=args.train_ratio,
         seed=args.seed,
         mode=args.data_mode,
+        exclude_sources=_parse_csv_arg(args.exclude_sources),
     )
 
     results = {}  # Collect all results
