@@ -1368,8 +1368,10 @@ def train_datarater(
                             allow_unused=True,
                         )
                         grads = [g.detach() if g is not None else None for g in grads]
+                        # Keep the warmup-updated weights attached so the next warmup
+                        # step can still differentiate w.r.t. the current fast weights.
                         fast_weights = {
-                            name: ((weight - inner_lr * grad_value) if grad_value is not None else weight).detach()
+                            name: ((weight - inner_lr * grad_value) if grad_value is not None else weight)
                             for (name, weight), grad_value in zip(fast_weights.items(), grads)
                         }
                     else:
