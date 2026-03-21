@@ -5,6 +5,7 @@ tokenize, split, and build DataLoaders.
 
 import math
 import logging
+import random
 from typing import Tuple, Optional, List, Dict
 
 import torch
@@ -336,6 +337,27 @@ def collate_tokenized_batch(batch):
     return out
 
 
+def _seed_worker(worker_id: int):
+    worker_seed = torch.initial_seed() % 2**32
+    random.seed(worker_seed)
+    try:
+        import numpy as np
+        np.random.seed(worker_seed)
+    except Exception:
+        pass
+
+
+def _build_loader_repro(seed: Optional[int], deterministic: bool) -> Dict:
+    if not deterministic or seed is None:
+        return {}
+    generator = torch.Generator()
+    generator.manual_seed(int(seed))
+    return {
+        "generator": generator,
+        "worker_init_fn": _seed_worker,
+    }
+
+
 def build_single_loader(
     dataset: Dataset,
     batch_size: int = DEFAULT_BATCH_SIZE,
@@ -343,6 +365,8 @@ def build_single_loader(
     shuffle: bool = False,
     sampler: Optional[Sampler] = None,
     drop_last: bool = False,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
 ) -> DataLoader:
     return DataLoader(
         dataset,
@@ -353,6 +377,7 @@ def build_single_loader(
         collate_fn=collate_tokenized_batch,
         drop_last=drop_last,
         pin_memory=True,
+        **_build_loader_repro(seed=seed, deterministic=deterministic),
     )
 
 
@@ -363,6 +388,8 @@ def build_dataloaders(
     num_workers: int = 2,
     train_sampler: Optional[Sampler] = None,
     shuffle_train: bool = True,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
 ) -> Tuple[DataLoader, DataLoader]:
     """
     Build DataLoaders with explicit collate function.
@@ -377,6 +404,7 @@ def build_dataloaders(
         collate_fn=collate_tokenized_batch,
         drop_last=True,
         pin_memory=True,
+        **_build_loader_repro(seed=seed, deterministic=deterministic),
     )
     val_loader = DataLoader(
         val_ds,
@@ -386,6 +414,10 @@ def build_dataloaders(
         collate_fn=collate_tokenized_batch,
         drop_last=False,
         pin_memory=True,
+        **_build_loader_repro(
+            seed=None if seed is None else int(seed) + 1,
+            deterministic=deterministic,
+        ),
     )
     return train_loader, val_loader
 
@@ -397,11 +429,13 @@ def prepare_data(
     dataset_name: str = "Bindwell/PPBA",
     max_length: int = DEFAULT_MAX_LEN,
     batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = 2,
     train_ratio: float = 0.8,
     seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
     mode: str = "combined_train",  # "combined_train" or "all"
     exclude_sources: Optional[List[str]] = None,
+    deterministic: bool = False,
 ) -> Tuple[DataLoader, DataLoader, Dataset, Dataset, Dataset, Dataset]:
     """
     One-call: download -> split -> tokenize -> dataloaders.
@@ -418,7 +452,14 @@ def prepare_data(
     )
     train_tok = tokenize_dataset(train_raw, max_length=max_length, model_name=ESM_MODEL_NAME)
     val_tok = tokenize_dataset(val_raw, max_length=max_length, model_name=ESM_MODEL_NAME)
-    train_loader, val_loader = build_dataloaders(train_tok, val_tok, batch_size=batch_size)
+    train_loader, val_loader = build_dataloaders(
+        train_tok,
+        val_tok,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        seed=seed,
+        deterministic=deterministic,
+    )
 
     logger.info(f"DataLoaders ready — train: {len(train_loader)} batches, val: {len(val_loader)} batches")
     return train_loader, val_loader, train_tok, val_tok, train_raw, val_raw

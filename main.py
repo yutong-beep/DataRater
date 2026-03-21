@@ -23,6 +23,13 @@ import argparse
 from datetime import datetime
 from collections import Counter
 
+def _cli_flag_present(flag: str) -> bool:
+    return any(arg == flag or arg.startswith(flag + "=") for arg in sys.argv[1:])
+
+
+if _cli_flag_present("--strict_deterministic"):
+    os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
 import torch
 import numpy as np
 
@@ -36,6 +43,10 @@ def parse_args():
     p.add_argument("--phase", type=str, default="1,2,3,4,5",
                    help="Comma-separated phases to run (e.g. '1,2,3,4,5' or '1')")
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--strict_deterministic", action="store_true",
+                   help="Enable stricter PyTorch/DataLoader determinism for reproducibility-focused reruns")
+    p.add_argument("--num_workers", type=int, default=2,
+                   help="DataLoader worker count (default: 2)")
     p.add_argument("--device", type=str, default=None,
                    help="Device (default: auto-detect)")
     p.add_argument("--output_dir", type=str, default="experiments",
@@ -269,6 +280,27 @@ def _parse_csv_arg(csv_arg: str) -> list:
     if csv_arg is None:
         return []
     return [part.strip() for part in str(csv_arg).split(",") if part.strip()]
+
+
+def _configure_reproducibility(seed: int, strict: bool = False):
+    import random
+
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if strict:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = False
+        if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+            torch.backends.cuda.matmul.allow_tf32 = False
 
 
 def _extract_sources_for_tokenized(train_tok, train_raw):
@@ -507,12 +539,7 @@ def run_teacher_train_only(args):
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    import random
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    _configure_reproducibility(seed, strict=args.strict_deterministic)
 
     if args.device:
         device = torch.device(args.device)
@@ -529,6 +556,8 @@ def run_teacher_train_only(args):
         batch_size=batch_size,
         train_ratio=train_ratio,
         seed=seed,
+        num_workers=args.num_workers,
+        deterministic=args.strict_deterministic,
         mode=data_mode,
         exclude_sources=exclude_sources,
     )
@@ -705,12 +734,7 @@ def run_teacher_downstream_only(args):
     with open(os.path.join(run_dir, "config.json"), "w") as f:
         json.dump(vars(args), f, indent=2)
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    import random
-    random.seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    _configure_reproducibility(seed, strict=args.strict_deterministic)
 
     if args.device:
         device = torch.device(args.device)
@@ -727,6 +751,8 @@ def run_teacher_downstream_only(args):
         batch_size=batch_size,
         train_ratio=train_ratio,
         seed=seed,
+        num_workers=args.num_workers,
+        deterministic=args.strict_deterministic,
         mode=data_mode,
         exclude_sources=exclude_sources,
     )
@@ -857,12 +883,7 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     # Seed
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
-    import random
-    random.seed(args.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(args.seed)
+    _configure_reproducibility(args.seed, strict=args.strict_deterministic)
 
     # Device
     if args.device:
@@ -887,6 +908,8 @@ def main():
         batch_size=args.batch_size,
         train_ratio=args.train_ratio,
         seed=args.seed,
+        num_workers=args.num_workers,
+        deterministic=args.strict_deterministic,
         mode=args.data_mode,
         exclude_sources=_parse_csv_arg(args.exclude_sources),
     )
@@ -970,6 +993,9 @@ def main():
         meta_train_loader, meta_val_loader = build_dataloaders(
             train_dataset, val_dataset,
             batch_size=args.meta_batch_size,
+            num_workers=args.num_workers,
+            seed=args.seed + 1000,
+            deterministic=args.strict_deterministic,
         )
 
         phase2_dir = os.path.join(run_dir, "phase2_datarater")
@@ -1106,6 +1132,9 @@ def main():
             retrain_train_loader, _ = build_dataloaders(
                 filtered_dataset, val_dataset,
                 batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                seed=args.seed + 2000,
+                deterministic=args.strict_deterministic,
             )
             phase5_train_size = len(filtered_dataset)
         else:
@@ -1205,6 +1234,9 @@ def main():
             random_loader, _ = build_dataloaders(
                 random_subset, val_dataset,
                 batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                seed=args.random_seed + 3000,
+                deterministic=args.strict_deterministic,
             )
             phase5_random_dir = os.path.join(run_dir, "phase5_random")
             random_result = train_baseline(
