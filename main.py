@@ -180,6 +180,10 @@ def parse_args():
                    help="Use first-order ablation (Task c)")
     p.add_argument("--sample_one_inner", action="store_true",
                    help="Sample 1 inner model per meta-step (Task f)")
+    p.add_argument("--meta_grad_clip", type=float, default=None,
+                   help="Optional max norm for DataRater meta-gradient clipping")
+    p.add_argument("--canary_interval", type=int, default=0,
+                   help="Run source-spread canary diagnostics every N meta-steps (0 disables)")
     p.add_argument("--inner_reset_strategy", type=str, default="random_init",
                    choices=["random_init", "carryover", "checkpoint_bank"],
                    help="How inner models are refreshed during meta-training")
@@ -191,12 +195,20 @@ def parse_args():
                    choices=["single", "multihead", "moe"],
                    help="DataRater architecture for Phase 2")
     p.add_argument("--outer_sampling", type=str, default="random",
-                   choices=["random", "balanced", "harder"],
+                   choices=["random", "balanced", "harder", "dataset_ratio", "custom_ratio"],
                    help="Outer-batch sampling mode for Phase 2")
     p.add_argument("--outer_per_source", type=int, default=None,
                    help="Samples per source in each balanced/harder outer batch (default: auto)")
     p.add_argument("--hard_outer_sources", type=str, default="SKEMPI v2.0,PDBbind v2020",
                    help="Comma-separated source names used when --outer_sampling harder")
+    p.add_argument("--outer_source_weights", type=str, default="",
+                   help="Comma-separated source=weight spec used when --outer_sampling custom_ratio")
+    p.add_argument("--inner_batch_scope", type=str, default="shared",
+                   choices=["shared", "per_inner"],
+                   help="Whether inner models share the same inner batches within a meta-step")
+    p.add_argument("--outer_batch_scope", type=str, default="shared",
+                   choices=["shared", "per_inner"],
+                   help="Whether inner models share the same outer batch within a meta-step")
     p.add_argument("--num_experts", type=int, default=4,
                    help="Number of experts when --datarater_arch moe")
     p.add_argument("--router_top_k", type=int, default=2, choices=[1, 2],
@@ -280,6 +292,21 @@ def _parse_csv_arg(csv_arg: str) -> list:
     if csv_arg is None:
         return []
     return [part.strip() for part in str(csv_arg).split(",") if part.strip()]
+
+
+def _parse_weight_spec(spec: str) -> dict:
+    out = {}
+    if spec is None:
+        return out
+    for part in str(spec).split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(f"Invalid weight spec item '{item}'. Expected source=weight.")
+        key, value = item.split("=", 1)
+        out[key.strip()] = float(value.strip())
+    return out
 
 
 def _configure_reproducibility(seed: int, strict: bool = False):
@@ -987,6 +1014,7 @@ def main():
         from meta_trainer import run_meta_training
         from data_utils import build_dataloaders
         hard_outer_sources = _parse_csv_arg(args.hard_outer_sources)
+        outer_source_weights = _parse_weight_spec(args.outer_source_weights)
         
         # Build specialized dataloaders with smaller meta_batch_size to prevent OOM
         logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
@@ -1004,6 +1032,7 @@ def main():
             val_loader=meta_val_loader,
             train_raw=train_raw_dataset,
             val_raw=val_raw_dataset,
+            train_dataset=train_dataset,
             n_meta_steps=args.meta_steps,
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
@@ -1016,6 +1045,8 @@ def main():
             mse_norm_eps=args.mse_norm_eps,
             use_first_order_ablation=args.ablation,
             sample_one_inner=args.sample_one_inner,
+            meta_grad_clip=args.meta_grad_clip,
+            canary_interval=args.canary_interval,
             inner_reset_strategy=args.inner_reset_strategy,
             inner_init_bank_dir=args.inner_init_bank_dir,
             inner_init_bank_jitter=args.inner_init_bank_jitter,
@@ -1024,6 +1055,9 @@ def main():
             outer_sampling=args.outer_sampling,
             outer_per_source=args.outer_per_source,
             hard_outer_sources=hard_outer_sources,
+            outer_source_weights=outer_source_weights,
+            inner_batch_scope=args.inner_batch_scope,
+            outer_batch_scope=args.outer_batch_scope,
             num_experts=args.num_experts,
             router_top_k=args.router_top_k,
             capacity_factor=args.capacity_factor,

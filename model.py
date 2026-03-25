@@ -653,6 +653,7 @@ def _build_outer_sampler(
     outer_sampling: str,
     outer_per_source: Optional[int],
     hard_outer_sources: Optional[Sequence[str]],
+    outer_source_weights: Optional[Dict[str, float]] = None,
 ):
     if outer_sampling == "random":
         return None
@@ -681,6 +682,7 @@ def _build_outer_sampler(
     if outer_sampling == "balanced":
         selected_sources = available_sources
         missing_sources = []
+        source_weights = {src: 1.0 for src in selected_sources}
     elif outer_sampling == "harder":
         requested_sources = list(hard_outer_sources) if hard_outer_sources else list(DEFAULT_HARD_OUTER_SOURCES)
         selected_sources, missing_sources = _resolve_requested_sources(requested_sources, available_sources)
@@ -689,13 +691,73 @@ def _build_outer_sampler(
                 f"outer_sampling='harder' found no matching sources. Requested={requested_sources}, "
                 f"available={available_sources}"
             )
+        source_weights = {src: 1.0 for src in selected_sources}
+    elif outer_sampling == "dataset_ratio":
+        selected_sources = available_sources
+        missing_sources = []
+        source_weights = {src: float(len(indices_by_source[src])) for src in selected_sources}
+    elif outer_sampling == "custom_ratio":
+        if not outer_source_weights:
+            raise ValueError("outer_sampling='custom_ratio' requires --outer_source_weights.")
+        selected_sources = [src for src in available_sources if float(outer_source_weights.get(src, 0.0)) > 0.0]
+        missing_sources = [
+            src for src, w in (outer_source_weights or {}).items()
+            if float(w) > 0.0 and src not in available_sources
+        ]
+        if not selected_sources:
+            raise ValueError(
+                f"outer_sampling='custom_ratio' found no matching positive-weight sources. "
+                f"requested={outer_source_weights}, available={available_sources}"
+            )
+        source_weights = {src: float(outer_source_weights.get(src, 0.0)) for src in selected_sources}
     else:
         raise ValueError(f"Unsupported outer_sampling mode: {outer_sampling}")
 
     base_batch_size = int(getattr(val_loader, "batch_size", 1) or 1)
-    per_source = int(outer_per_source) if outer_per_source is not None else max(1, base_batch_size // max(1, len(selected_sources)))
-    if per_source <= 0:
+    total_count = (
+        int(outer_per_source) * max(1, len(selected_sources))
+        if outer_per_source is not None
+        else max(1, base_batch_size)
+    )
+    if total_count <= 0:
         raise ValueError("outer_per_source must be positive when provided.")
+
+    active_sources = [src for src in selected_sources if float(source_weights.get(src, 0.0)) > 0.0]
+    if not active_sources:
+        raise ValueError(f"outer_sampling={outer_sampling} produced no active sources.")
+
+    if total_count < len(active_sources):
+        logger.warning(
+            "[meta] outer batch size %d is smaller than active source count %d; "
+            "some sources will be dropped from each sampled batch.",
+            total_count,
+            len(active_sources),
+        )
+    base_counts = {src: 0 for src in active_sources}
+    if total_count >= len(active_sources):
+        for src in active_sources:
+            base_counts[src] = 1
+    remaining = max(0, total_count - sum(base_counts.values()))
+    weight_sum = sum(float(source_weights[src]) for src in active_sources)
+    if remaining > 0:
+        raw_allocations = {
+            src: (remaining * float(source_weights[src]) / weight_sum) if weight_sum > 0 else (remaining / len(active_sources))
+            for src in active_sources
+        }
+        floor_allocations = {src: int(math.floor(val)) for src, val in raw_allocations.items()}
+        for src, floor_count in floor_allocations.items():
+            base_counts[src] += floor_count
+        leftover = remaining - sum(floor_allocations.values())
+        if leftover > 0:
+            order = sorted(
+                active_sources,
+                key=lambda src: (raw_allocations[src] - floor_allocations[src], float(source_weights[src]), src),
+                reverse=True,
+            )
+            for src in order[:leftover]:
+                base_counts[src] += 1
+
+    counts_by_source = {src: int(cnt) for src, cnt in base_counts.items() if int(cnt) > 0}
 
     if missing_sources:
         logger.warning(
@@ -704,11 +766,11 @@ def _build_outer_sampler(
             ", ".join(missing_sources),
         )
     logger.info(
-        "[meta] outer_sampling=%s | selected_sources=%s | outer_per_source=%d | outer_batch_size=%d",
+        "[meta] outer_sampling=%s | selected_sources=%s | outer_batch_size=%d | counts_by_source=%s",
         outer_sampling,
         selected_sources,
-        per_source,
-        per_source * len(selected_sources),
+        sum(counts_by_source.values()),
+        counts_by_source,
     )
 
     return {
@@ -716,7 +778,7 @@ def _build_outer_sampler(
         "collate_fn": collate_fn,
         "indices_by_source": indices_by_source,
         "selected_sources": selected_sources,
-        "per_source": per_source,
+        "counts_by_source": counts_by_source,
         "mode": outer_sampling,
     }
 
@@ -726,15 +788,17 @@ def _sample_outer_batch(outer_sampler):
         raise ValueError("outer_sampler must be initialized before sampling.")
 
     sampled_indices: List[int] = []
-    per_source = int(outer_sampler["per_source"])
     for source_name in outer_sampler["selected_sources"]:
         candidates = outer_sampler["indices_by_source"][source_name]
+        target_count = int(outer_sampler["counts_by_source"].get(source_name, 0))
+        if target_count <= 0:
+            continue
         if not candidates:
             continue
-        if per_source <= len(candidates):
-            chosen = random.sample(candidates, per_source)
+        if target_count <= len(candidates):
+            chosen = random.sample(candidates, target_count)
         else:
-            chosen = random.choices(candidates, k=per_source)
+            chosen = random.choices(candidates, k=target_count)
         sampled_indices.extend(int(idx) for idx in chosen)
 
     if not sampled_indices:
@@ -766,6 +830,112 @@ def _safe_mean(grads: List[Optional[torch.Tensor]], like: torch.Tensor) -> torch
     if not valid:
         return torch.zeros_like(like)
     return torch.stack(valid, dim=0).mean(dim=0)
+
+
+def _grad_total_norm(params: Sequence[torch.Tensor]) -> float:
+    total_sq = 0.0
+    for param in params:
+        if param.grad is None:
+            continue
+        norm = float(param.grad.detach().norm(2).item())
+        total_sq += norm * norm
+    return math.sqrt(total_sq)
+
+
+def _rankdata(values: Sequence[float]) -> List[float]:
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson_from_lists(xs: Sequence[float], ys: Sequence[float]) -> float:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return float("nan")
+    x_mean = sum(xs) / float(len(xs))
+    y_mean = sum(ys) / float(len(ys))
+    num = sum((x - x_mean) * (y - y_mean) for x, y in zip(xs, ys))
+    den_x = sum((x - x_mean) ** 2 for x in xs)
+    den_y = sum((y - y_mean) ** 2 for y in ys)
+    denom = math.sqrt(den_x * den_y)
+    if denom <= 0.0:
+        return float("nan")
+    return num / denom
+
+
+def _spearman_from_lists(xs: Sequence[float], ys: Sequence[float]) -> float:
+    if len(xs) != len(ys) or len(xs) < 2:
+        return float("nan")
+    return _pearson_from_lists(_rankdata(xs), _rankdata(ys))
+
+
+def _quantile(values: Sequence[float], q: float) -> float:
+    vals = sorted(float(v) for v in values)
+    if not vals:
+        return float("nan")
+    x = (len(vals) - 1) * float(q)
+    lo = int(math.floor(x))
+    hi = min(lo + 1, len(vals) - 1)
+    alpha = x - lo
+    return vals[lo] * (1.0 - alpha) + vals[hi] * alpha
+
+
+def _canary_probe(
+    data_rater: nn.Module,
+    train_dataset,
+    train_raw,
+    n_probe: int = 500,
+    device: Optional[torch.device] = None,
+) -> Dict[str, object]:
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    data_rater.eval()
+    probe_count = min(int(n_probe), len(train_dataset))
+    probe_indices = random.sample(range(len(train_dataset)), probe_count)
+    scores: List[float] = []
+    pkds: List[float] = []
+    sources: List[str] = []
+
+    with torch.no_grad():
+        for idx in probe_indices:
+            sample = train_dataset[idx]
+            ids = sample["input_ids"].unsqueeze(0).to(device)
+            mask = sample["attention_mask"].unsqueeze(0).to(device)
+            raw_score = datarater_forward(data_rater, ids, mask).view(-1)
+            scores.append(float(raw_score[0].item()))
+            pkds.append(float(sample["affinity"]))
+
+            raw_v = sample.get("raw_index", -1)
+            raw_idx = int(raw_v.item()) if torch.is_tensor(raw_v) else int(raw_v)
+            if train_raw is not None and "source" in train_raw.column_names and 0 <= raw_idx < len(train_raw):
+                sources.append(str(train_raw[raw_idx]["source"]))
+            else:
+                sources.append("UNKNOWN")
+
+    data_rater.train()
+
+    source_iqrs: Dict[str, float] = {}
+    for src in sorted(set(sources)):
+        src_scores = [score for score, source in zip(scores, sources) if source == src]
+        if len(src_scores) < 2:
+            source_iqrs[src] = 0.0
+        else:
+            source_iqrs[src] = float(_quantile(src_scores, 0.75) - _quantile(src_scores, 0.25))
+
+    return {
+        "spearman": float(_spearman_from_lists(scores, pkds)),
+        "source_iqrs": source_iqrs,
+        "n_probe": probe_count,
+    }
 
 
 def _pearson_loss(pred: torch.Tensor, target: torch.Tensor, eps: float) -> torch.Tensor:
@@ -1051,6 +1221,13 @@ def train_datarater(
     outer_sampling: str = "random",
     outer_per_source: Optional[int] = None,
     hard_outer_sources: Optional[Sequence[str]] = None,
+    outer_source_weights: Optional[Dict[str, float]] = None,
+    inner_batch_scope: str = "shared",
+    outer_batch_scope: str = "shared",
+    meta_grad_clip: Optional[float] = None,
+    canary_interval: int = 0,
+    train_dataset=None,
+    meta_grad_log_path: Optional[str] = None,
     num_experts: int = 4,
     router_top_k: int = 2,
     capacity_factor: float = 1.25,
@@ -1085,8 +1262,14 @@ def train_datarater(
             raise ValueError("alpha must be in [0, 1].")
         if datarater_arch not in {"single", "multihead", "moe"}:
             raise ValueError("datarater_arch must be one of {'single', 'multihead', 'moe'}.")
-        if outer_sampling not in {"random", "balanced", "harder"}:
-            raise ValueError("outer_sampling must be one of {'random', 'balanced', 'harder'}.")
+        if outer_sampling not in {"random", "balanced", "harder", "dataset_ratio", "custom_ratio"}:
+            raise ValueError(
+                "outer_sampling must be one of {'random', 'balanced', 'harder', 'dataset_ratio', 'custom_ratio'}."
+            )
+        if inner_batch_scope not in {"shared", "per_inner"}:
+            raise ValueError("inner_batch_scope must be one of {'shared', 'per_inner'}.")
+        if outer_batch_scope not in {"shared", "per_inner"}:
+            raise ValueError("outer_batch_scope must be one of {'shared', 'per_inner'}.")
         if inner_reset_strategy not in {"random_init", "carryover", "checkpoint_bank"}:
             raise ValueError("inner_reset_strategy must be one of {'random_init', 'carryover', 'checkpoint_bank'}.")
         if router_aux_loss_coef < 0.0:
@@ -1106,12 +1289,15 @@ def train_datarater(
         T_backprop_eff = min(T_backprop, T_window)
         T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
         logger.info(
-            "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s, inner_reset=%s",
+            "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s, "
+            "inner_batch_scope=%s, outer_batch_scope=%s, inner_reset=%s",
             T_window,
             T_backprop_eff,
             T_warmup,
             datarater_arch,
             outer_sampling,
+            inner_batch_scope,
+            outer_batch_scope,
             inner_reset_strategy,
         )
 
@@ -1228,7 +1414,15 @@ def train_datarater(
             outer_sampling=outer_sampling,
             outer_per_source=outer_per_source,
             hard_outer_sources=hard_outer_sources,
+            outer_source_weights=outer_source_weights,
         )
+
+        if meta_grad_log_path:
+            meta_grad_log_dir = os.path.dirname(meta_grad_log_path)
+            if meta_grad_log_dir:
+                os.makedirs(meta_grad_log_dir, exist_ok=True)
+            with open(meta_grad_log_path, "w") as f:
+                f.write("")
 
         if use_first_order_ablation:
             logger.warning(
@@ -1272,18 +1466,22 @@ def train_datarater(
             outer_loss_values = []
             step_router_infos = []
 
-            inner_batches = []
-            for _ in range(T_window):
-                x_in, train_iter = _next_batch(train_iter, train_loader)
-                inner_batches.append(x_in)
+            shared_inner_batches = None
+            if inner_batch_scope == "shared":
+                shared_inner_batches = []
+                for _ in range(T_window):
+                    x_in, train_iter = _next_batch(train_iter, train_loader)
+                    shared_inner_batches.append(x_in)
 
-            if outer_sampling == "random":
-                x_out, val_iter = _next_batch(val_iter, val_loader)
-            else:
-                x_out = _sample_outer_batch(outer_sampler)
+            shared_outer_batch = None
+            if outer_batch_scope == "shared":
+                if outer_sampling == "random":
+                    shared_outer_batch, val_iter = _next_batch(val_iter, val_loader)
+                else:
+                    shared_outer_batch = _sample_outer_batch(outer_sampler)
 
-            if datarater_arch == "moe":
-                for x_in in inner_batches:
+            if datarater_arch == "moe" and shared_inner_batches is not None:
+                for x_in in shared_inner_batches:
                     input_ids = x_in["input_ids"].to(device)
                     mask = x_in["attention_mask"].to(device)
                     raw_index = x_in.get("raw_index")
@@ -1300,36 +1498,37 @@ def train_datarater(
                     if router_info is not None:
                         step_router_infos.append(router_info)
 
-            out_ids = x_out["input_ids"].to(device)
-            out_mask = x_out["attention_mask"].to(device)
-            out_targets = x_out["affinity"].to(device)
-            out_raw_index = x_out.get("raw_index")
-            if out_raw_index is not None:
-                out_raw_index = out_raw_index.to(device)
-
-            batch_src_std = None
-            if outer_objective in {"mse_norm", "mix"}:
-                if out_raw_index is not None and val_raw is not None:
-                    batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
-                else:
-                    batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
-
-            batch_source_labels = None
-            if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
-                n_val = len(val_raw)
-                has_src = "source" in val_raw.column_names
-                batch_source_labels = []
-                for idx in out_raw_index.detach().cpu().tolist():
-                    if 0 <= int(idx) < n_val and has_src:
-                        batch_source_labels.append(str(val_raw[int(idx)]["source"]))
-                    else:
-                        batch_source_labels.append("__unknown__")
-
             params = tuple(data_rater.parameters())
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
                 fast_weights = dict(inner_model.named_parameters())
+
+                if shared_inner_batches is None:
+                    inner_batches = []
+                    for _ in range(T_window):
+                        x_in, train_iter = _next_batch(train_iter, train_loader)
+                        inner_batches.append(x_in)
+                else:
+                    inner_batches = shared_inner_batches
+
+                if datarater_arch == "moe" and shared_inner_batches is None:
+                    for x_in in inner_batches:
+                        input_ids = x_in["input_ids"].to(device)
+                        mask = x_in["attention_mask"].to(device)
+                        raw_index = x_in.get("raw_index")
+                        if raw_index is not None:
+                            raw_index = raw_index.to(device)
+                        _, router_info = datarater_forward(
+                            data_rater,
+                            input_ids,
+                            mask,
+                            raw_indices=raw_index,
+                            raw_dataset=train_raw,
+                            return_router_info=True,
+                        )
+                        if router_info is not None:
+                            step_router_infos.append(router_info)
 
                 for inner_step_idx, x_in in enumerate(inner_batches):
                     input_ids = x_in["input_ids"].to(device)
@@ -1389,6 +1588,39 @@ def train_datarater(
                             raw_indices=raw_index,
                             raw_dataset=train_raw,
                         )
+
+                if shared_outer_batch is None:
+                    if outer_sampling == "random":
+                        x_out, val_iter = _next_batch(val_iter, val_loader)
+                    else:
+                        x_out = _sample_outer_batch(outer_sampler)
+                else:
+                    x_out = shared_outer_batch
+
+                out_ids = x_out["input_ids"].to(device)
+                out_mask = x_out["attention_mask"].to(device)
+                out_targets = x_out["affinity"].to(device)
+                out_raw_index = x_out.get("raw_index")
+                if out_raw_index is not None:
+                    out_raw_index = out_raw_index.to(device)
+
+                batch_src_std = None
+                if outer_objective in {"mse_norm", "mix"}:
+                    if out_raw_index is not None and val_raw is not None:
+                        batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
+                    else:
+                        batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
+
+                batch_source_labels = None
+                if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
+                    n_val = len(val_raw)
+                    has_src = "source" in val_raw.column_names
+                    batch_source_labels = []
+                    for idx in out_raw_index.detach().cpu().tolist():
+                        if 0 <= int(idx) < n_val and has_src:
+                            batch_source_labels.append(str(val_raw[int(idx)]["source"]))
+                        else:
+                            batch_source_labels.append("__unknown__")
 
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
                 if use_zscore_inner and src2zscore and out_raw_index is not None and val_raw is not None:
@@ -1454,6 +1686,11 @@ def train_datarater(
                     else:
                         param.grad = param.grad + grad_value
 
+            grad_norm_pre_clip = _grad_total_norm(params)
+            if meta_grad_clip is not None and float(meta_grad_clip) > 0.0:
+                torch.nn.utils.clip_grad_norm_(params, max_norm=float(meta_grad_clip))
+            grad_norm_post_clip = _grad_total_norm(params)
+
             rater_opt.step()
 
             if (step + 1) % 50 == 0:
@@ -1467,7 +1704,8 @@ def train_datarater(
                     )
                     msg = (
                         f"[meta] step {step+1}/{n_meta_steps} | obj={outer_objective} "
-                        f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f}"
+                        f"| outer_loss={outer_loss_value:.6f} | grad_norm_sum={gsum:.4f} "
+                        f"| grad_norm_pre={grad_norm_pre_clip:.4f} | grad_norm_post={grad_norm_post_clip:.4f}"
                     )
                     if batch_src_std is not None:
                         msg += f" | mean_src_std={float(batch_src_std.mean().item()):.6f}"
@@ -1486,6 +1724,36 @@ def train_datarater(
                     if reset_events:
                         msg += " | resets=" + ";".join(reset_events)
                 logger.info(msg)
+                if meta_grad_log_path:
+                    with open(meta_grad_log_path, "a") as f:
+                        f.write(json.dumps({
+                            "step": int(step + 1),
+                            "outer_objective": outer_objective,
+                            "outer_loss": float(outer_loss_value),
+                            "grad_norm_sum": float(gsum),
+                            "grad_norm_pre_clip": float(grad_norm_pre_clip),
+                            "grad_norm_post_clip": float(grad_norm_post_clip),
+                            "meta_grad_clip": None if meta_grad_clip is None else float(meta_grad_clip),
+                            "inner_batch_scope": inner_batch_scope,
+                            "outer_batch_scope": outer_batch_scope,
+                            "outer_sampling": outer_sampling,
+                            "reset_events": list(reset_events),
+                        }) + "\n")
+
+            if train_dataset is not None and canary_interval > 0 and (step + 1) % int(canary_interval) == 0:
+                canary = _canary_probe(data_rater, train_dataset, train_raw, n_probe=500, device=device)
+                canary_msg = f"[canary] step {step+1} | Spearman={canary['spearman']:.4f}"
+                for src, iqr_val in sorted(canary["source_iqrs"].items()):
+                    canary_msg += f" | {src}_IQR={iqr_val:.3f}"
+                logger.info(canary_msg)
+
+                pdz_iqr = canary["source_iqrs"].get("PDZ_PBM")
+                if pdz_iqr is not None and pdz_iqr < 1.0:
+                    logger.warning(
+                        "[CANARY WARNING] step %d: PDZ_PBM IQR=%.4f < 1.0 -- DataRater may be collapsing!",
+                        step + 1,
+                        pdz_iqr,
+                    )
 
         return data_rater
 
