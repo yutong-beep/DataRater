@@ -38,6 +38,7 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         input_ids,
         attention_mask,
         targets,
+        precomputed_raw_scores,
         *all_values,
     ):
         num_fw = len(fast_weight_keys)
@@ -71,14 +72,17 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         rater_dict = _build_param_dict(rater_keys, rater_req)
 
         with torch.enable_grad():
-            raw_scores = functional_datarater_forward_fn(
-                data_rater,
-                rater_dict,
-                input_ids,
-                attention_mask,
-                raw_indices=ctx.raw_indices,
-                raw_dataset=raw_dataset,
-            )
+            if precomputed_raw_scores is None:
+                raw_scores = functional_datarater_forward_fn(
+                    data_rater,
+                    rater_dict,
+                    input_ids,
+                    attention_mask,
+                    raw_indices=ctx.raw_indices,
+                    raw_dataset=raw_dataset,
+                )
+            else:
+                raw_scores = precomputed_raw_scores.detach()
             weights = F.softmax(raw_scores / tau, dim=0)
 
             preds = functional_forward_fn(inner_model, fw_dict, input_ids, attention_mask)
@@ -167,6 +171,7 @@ class MixFlowMGInnerStep(torch.autograd.Function):
             None,
             None,
             None,
+            None,
             *grad_fw,
             *grad_rater,
         )
@@ -185,6 +190,7 @@ def mixflow_inner_update(
     functional_datarater_forward_fn,
     raw_indices=None,
     raw_dataset=None,
+    precomputed_raw_scores=None,
 ):
     fast_weight_keys = tuple(fast_weights.keys())
     fw_values = tuple(fast_weights.values())
@@ -207,6 +213,7 @@ def mixflow_inner_update(
         input_ids,
         attention_mask,
         targets,
+        precomputed_raw_scores,
         *fw_values,
         *rater_values,
     )

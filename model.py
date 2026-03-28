@@ -595,6 +595,69 @@ def _batch_sources_from_raw_indices(raw_indices, raw_dataset) -> List[str]:
     return sources
 
 
+def _raw_indices_to_source_labels(raw_indices, raw_dataset) -> List[str]:
+    if raw_indices is None:
+        return []
+    if torch.is_tensor(raw_indices):
+        if raw_indices.ndim == 0:
+            raw_idx_list = [int(raw_indices.item())]
+        else:
+            raw_idx_list = [int(v) for v in raw_indices.detach().cpu().tolist()]
+    elif isinstance(raw_indices, (list, tuple)):
+        raw_idx_list = [int(v) for v in raw_indices]
+    else:
+        raw_idx_list = [int(raw_indices)]
+    return [_source_from_raw_index(raw_idx, raw_dataset) for raw_idx in raw_idx_list]
+
+
+def _accumulate_source_values(
+    accum: Dict[str, Dict[str, float]],
+    source_labels: Sequence[str],
+    values: torch.Tensor,
+) -> None:
+    if not source_labels:
+        return
+    flat_values = values.detach().float().reshape(-1).cpu().tolist()
+    if len(flat_values) != len(source_labels):
+        raise ValueError("source_labels and values must have the same length.")
+    for src, value in zip(source_labels, flat_values):
+        src_key = str(src)
+        slot = accum.setdefault(src_key, {"sum": 0.0, "count": 0})
+        slot["sum"] += float(value)
+        slot["count"] += 1
+
+
+def _finalize_source_values(accum: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+    sum_by_source = {src: float(slot["sum"]) for src, slot in accum.items()}
+    count_by_source = {src: int(slot["count"]) for src, slot in accum.items()}
+    mean_by_source = {
+        src: float(slot["sum"] / max(int(slot["count"]), 1))
+        for src, slot in accum.items()
+    }
+    return {
+        "sum_by_source": sum_by_source,
+        "count_by_source": count_by_source,
+        "mean_by_source": mean_by_source,
+    }
+
+
+def _source_dict_corr(
+    left: Dict[str, float],
+    right: Dict[str, float],
+) -> Optional[float]:
+    shared = sorted(set(left) & set(right))
+    if len(shared) < 2:
+        return None
+    left_t = torch.tensor([float(left[src]) for src in shared], dtype=torch.float32)
+    right_t = torch.tensor([float(right[src]) for src in shared], dtype=torch.float32)
+    if torch.std(left_t, unbiased=False).item() == 0.0 or torch.std(right_t, unbiased=False).item() == 0.0:
+        return None
+    corr = torch.corrcoef(torch.stack([left_t, right_t], dim=0))[0, 1]
+    if not torch.isfinite(corr):
+        return None
+    return float(corr.item())
+
+
 def datarater_forward(
     data_rater: nn.Module,
     input_ids: torch.Tensor,
@@ -1423,6 +1486,11 @@ def train_datarater(
                 os.makedirs(meta_grad_log_dir, exist_ok=True)
             with open(meta_grad_log_path, "w") as f:
                 f.write("")
+            meta_source_log_path = os.path.join(meta_grad_log_dir or ".", "meta_source_metrics.jsonl")
+            with open(meta_source_log_path, "w") as f:
+                f.write("")
+        else:
+            meta_source_log_path = None
 
         if use_first_order_ablation:
             logger.warning(
@@ -1430,6 +1498,7 @@ def train_datarater(
             )
 
         data_rater.train()
+        prev_outer_loss_mean_by_source: Optional[Dict[str, float]] = None
 
         for step in range(n_meta_steps):
             # staggered resets
@@ -1465,6 +1534,9 @@ def train_datarater(
             meta_grads_accumulator = []
             outer_loss_values = []
             step_router_infos = []
+            step_inner_score_stats: Dict[str, Dict[str, float]] = {}
+            step_inner_weight_stats: Dict[str, Dict[str, float]] = {}
+            step_outer_loss_stats: Dict[str, Dict[str, float]] = {}
 
             shared_inner_batches = None
             if inner_batch_scope == "shared":
@@ -1548,15 +1620,21 @@ def train_datarater(
                             zscore_global_std,
                         )
 
+                    raw_scores = datarater_forward(
+                        data_rater,
+                        input_ids,
+                        mask,
+                        raw_indices=raw_index,
+                        raw_dataset=train_raw,
+                    )
+                    weights = F.softmax(raw_scores / tau, dim=0)
+                    inner_source_labels = _raw_indices_to_source_labels(raw_index, train_raw)
+                    if inner_source_labels:
+                        _accumulate_source_values(step_inner_score_stats, inner_source_labels, raw_scores)
+                        _accumulate_source_values(step_inner_weight_stats, inner_source_labels, weights)
+
                     if inner_step_idx < T_warmup:
-                        raw_scores = datarater_forward(
-                            data_rater,
-                            input_ids,
-                            mask,
-                            raw_indices=raw_index,
-                            raw_dataset=train_raw,
-                        )
-                        weights = F.softmax(raw_scores / tau, dim=0).detach()
+                        weights = weights.detach()
                         preds = functional_forward(inner_model, fast_weights, input_ids, mask)
                         per = F.mse_loss(preds.float(), targets.float(), reduction="none")
                         inner_loss = torch.sum(weights.float() * per)
@@ -1587,6 +1665,7 @@ def train_datarater(
                             functional_datarater_forward_fn=functional_datarater_forward,
                             raw_indices=raw_index,
                             raw_dataset=train_raw,
+                            precomputed_raw_scores=raw_scores,
                         )
 
                 if shared_outer_batch is None:
@@ -1611,16 +1690,8 @@ def train_datarater(
                     else:
                         batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
 
-                batch_source_labels = None
-                if outer_objective == "source_stratified_mse" and out_raw_index is not None and val_raw is not None:
-                    n_val = len(val_raw)
-                    has_src = "source" in val_raw.column_names
-                    batch_source_labels = []
-                    for idx in out_raw_index.detach().cpu().tolist():
-                        if 0 <= int(idx) < n_val and has_src:
-                            batch_source_labels.append(str(val_raw[int(idx)]["source"]))
-                        else:
-                            batch_source_labels.append("__unknown__")
+                outer_source_labels = _raw_indices_to_source_labels(out_raw_index, val_raw)
+                batch_source_labels = outer_source_labels if outer_objective == "source_stratified_mse" else None
 
                 outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
                 if use_zscore_inner and src2zscore and out_raw_index is not None and val_raw is not None:
@@ -1632,6 +1703,10 @@ def train_datarater(
                         zscore_global_mean,
                         zscore_global_std,
                     )
+
+                outer_per_sample_mse = (outer_preds.detach().float() - out_targets.detach().float()) ** 2
+                if outer_source_labels:
+                    _accumulate_source_values(step_outer_loss_stats, outer_source_labels, outer_per_sample_mse)
 
                 outer_loss = _compute_outer_loss(
                     objective=outer_objective,
@@ -1692,6 +1767,59 @@ def train_datarater(
             grad_norm_post_clip = _grad_total_norm(params)
 
             rater_opt.step()
+
+            inner_score_summary = _finalize_source_values(step_inner_score_stats)
+            inner_weight_summary = _finalize_source_values(step_inner_weight_stats)
+            outer_loss_summary = _finalize_source_values(step_outer_loss_stats)
+
+            inner_score_mean_by_source = inner_score_summary["mean_by_source"]
+            inner_weight_mean_by_source = inner_weight_summary["mean_by_source"]
+            inner_weight_sum_by_source = inner_weight_summary["sum_by_source"]
+            inner_weight_count_by_source = inner_weight_summary["count_by_source"]
+            outer_loss_mean_by_source = outer_loss_summary["mean_by_source"]
+            outer_loss_count_by_source = outer_loss_summary["count_by_source"]
+            total_inner_weight = sum(inner_weight_sum_by_source.values())
+            inner_weight_share_by_source = {
+                src: float(weight_sum / total_inner_weight)
+                for src, weight_sum in inner_weight_sum_by_source.items()
+            } if total_inner_weight > 0.0 else {}
+            outer_loss_delta_by_source = None
+            if prev_outer_loss_mean_by_source is not None:
+                shared_sources = sorted(set(prev_outer_loss_mean_by_source) & set(outer_loss_mean_by_source))
+                if shared_sources:
+                    outer_loss_delta_by_source = {
+                        src: float(outer_loss_mean_by_source[src] - prev_outer_loss_mean_by_source[src])
+                        for src in shared_sources
+                    }
+            weight_share_vs_outer_loss_corr = _source_dict_corr(inner_weight_share_by_source, outer_loss_mean_by_source)
+            weight_share_vs_outer_delta_corr = _source_dict_corr(
+                inner_weight_share_by_source,
+                outer_loss_delta_by_source or {},
+            )
+            prev_outer_loss_mean_by_source = dict(outer_loss_mean_by_source)
+
+            if meta_source_log_path:
+                with open(meta_source_log_path, "a") as f:
+                    f.write(json.dumps({
+                        "step": int(step + 1),
+                        "outer_objective": outer_objective,
+                        "outer_sampling": outer_sampling,
+                        "inner_batch_scope": inner_batch_scope,
+                        "outer_batch_scope": outer_batch_scope,
+                        "models_processed": int(len(models_to_process)),
+                        "inner_score_mean_by_source": inner_score_mean_by_source,
+                        "inner_score_count_by_source": inner_score_summary["count_by_source"],
+                        "inner_weight_mean_by_source": inner_weight_mean_by_source,
+                        "inner_weight_sum_by_source": inner_weight_sum_by_source,
+                        "inner_weight_count_by_source": inner_weight_count_by_source,
+                        "inner_weight_share_by_source": inner_weight_share_by_source,
+                        "outer_loss_mean_by_source": outer_loss_mean_by_source,
+                        "outer_loss_count_by_source": outer_loss_count_by_source,
+                        "outer_loss_delta_by_source": outer_loss_delta_by_source,
+                        "weight_share_vs_outer_loss_corr": weight_share_vs_outer_loss_corr,
+                        "weight_share_vs_outer_loss_delta_corr": weight_share_vs_outer_delta_corr,
+                        "reset_events": list(reset_events),
+                    }) + "\n")
 
             if (step + 1) % 50 == 0:
                 with torch.no_grad():
