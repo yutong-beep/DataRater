@@ -1263,6 +1263,219 @@ def _compute_outer_loss(
     raise ValueError(f"Unsupported outer_objective: {objective}")
 
 
+def _compute_score_grad_diagnostics(
+    *,
+    data_rater: nn.Module,
+    inner_model: nn.Module,
+    initial_fast_weights: Dict[str, torch.Tensor],
+    inner_batches: Sequence[dict],
+    outer_batch: dict,
+    train_raw,
+    val_raw,
+    src2zscore: Dict[str, Tuple[float, float]],
+    zscore_global_mean: float,
+    zscore_global_std: float,
+    use_zscore_inner: bool,
+    T_warmup: int,
+    inner_lr: float,
+    tau: float,
+    inner_weighting: str,
+    inner_source_score_bias: Optional[Dict[str, float]],
+    inner_source_weight_cap: Optional[Dict[str, float]],
+    score_within_source_std_floor: float,
+    score_within_source_std_penalty_coef: float,
+    score_source_bias_penalty_coef: float,
+    outer_objective: str,
+    alpha: float,
+    outer_eps: float,
+    mse_norm_eps: float,
+    src2std: Dict[str, float],
+    global_std: float,
+    device: torch.device,
+) -> Dict[str, object]:
+    fast_weights = {
+        name: value.detach().clone().requires_grad_(True)
+        for name, value in initial_fast_weights.items()
+    }
+    tracked: List[Dict[str, object]] = []
+
+    for inner_step_idx, x_in in enumerate(inner_batches):
+        input_ids = x_in["input_ids"].to(device)
+        mask = x_in["attention_mask"].to(device)
+        targets = x_in["affinity"].to(device)
+        raw_index = x_in.get("raw_index")
+        if raw_index is not None:
+            raw_index = raw_index.to(device)
+
+        if use_zscore_inner and src2zscore and raw_index is not None:
+            targets = _zscore_normalize_targets(
+                targets,
+                raw_index,
+                train_raw,
+                src2zscore,
+                zscore_global_mean,
+                zscore_global_std,
+            )
+
+        source_labels = _raw_indices_to_source_labels(raw_index, train_raw)
+        raw_scores = datarater_forward(
+            data_rater,
+            input_ids,
+            mask,
+            raw_indices=raw_index,
+            raw_dataset=train_raw,
+        )
+        raw_scores = apply_source_score_bias(raw_scores, source_labels, inner_source_score_bias)
+        raw_scores.retain_grad()
+        weights = compute_inner_weights(raw_scores, tau=tau, weighting_mode=inner_weighting)
+        weights, _ = apply_source_weight_cap(weights, source_labels, inner_source_weight_cap)
+        score_reg_loss, _ = compute_score_regularization(
+            raw_scores,
+            source_labels,
+            within_source_std_floor=score_within_source_std_floor,
+            within_source_std_penalty_coef=score_within_source_std_penalty_coef,
+            source_bias_penalty_coef=score_source_bias_penalty_coef,
+        )
+
+        preds = functional_forward(inner_model, fast_weights, input_ids, mask)
+        per = F.mse_loss(preds.float(), targets.float(), reduction="none")
+        if inner_step_idx < T_warmup:
+            inner_loss = torch.sum(weights.detach().float() * per)
+            grads = torch.autograd.grad(
+                inner_loss,
+                tuple(fast_weights.values()),
+                create_graph=False,
+                allow_unused=True,
+            )
+            grads = [g.detach() if g is not None else None for g in grads]
+        else:
+            inner_loss = torch.sum(weights.float() * per) + score_reg_loss
+            grads = torch.autograd.grad(
+                inner_loss,
+                tuple(fast_weights.values()),
+                create_graph=True,
+                allow_unused=True,
+            )
+
+        fast_weights = {
+            name: ((weight - inner_lr * grad_value) if grad_value is not None else weight)
+            for (name, weight), grad_value in zip(fast_weights.items(), grads)
+        }
+        tracked.append(
+            {
+                "inner_step_idx": int(inner_step_idx),
+                "raw_scores": raw_scores,
+                "source_labels": list(source_labels),
+            }
+        )
+
+    out_ids = outer_batch["input_ids"].to(device)
+    out_mask = outer_batch["attention_mask"].to(device)
+    out_targets = outer_batch["affinity"].to(device)
+    out_raw_index = outer_batch.get("raw_index")
+    if out_raw_index is not None:
+        out_raw_index = out_raw_index.to(device)
+
+    batch_src_std = None
+    if outer_objective in {"mse_norm", "mix"}:
+        if out_raw_index is not None and val_raw is not None:
+            batch_src_std = _lookup_batch_src_std(out_raw_index, val_raw, src2std, global_std, device)
+        else:
+            batch_src_std = torch.full_like(out_targets, fill_value=float(global_std))
+
+    outer_source_labels = _raw_indices_to_source_labels(out_raw_index, val_raw)
+    batch_source_labels = outer_source_labels if outer_objective == "source_stratified_mse" else None
+
+    outer_preds = functional_forward(inner_model, fast_weights, out_ids, out_mask)
+    if use_zscore_inner and src2zscore and out_raw_index is not None and val_raw is not None:
+        outer_preds = _zscore_unnormalize_preds(
+            outer_preds,
+            out_raw_index,
+            val_raw,
+            src2zscore,
+            zscore_global_mean,
+            zscore_global_std,
+        )
+
+    outer_loss = _compute_outer_loss(
+        objective=outer_objective,
+        preds=outer_preds.float(),
+        targets=out_targets.float(),
+        src_std=batch_src_std,
+        alpha=alpha,
+        outer_eps=outer_eps,
+        mse_norm_eps=mse_norm_eps,
+        source_labels=batch_source_labels,
+    )
+
+    grad_targets = [entry["raw_scores"] for entry in tracked]
+    score_grads = torch.autograd.grad(
+        outer_loss,
+        grad_targets,
+        retain_graph=False,
+        allow_unused=True,
+    )
+
+    by_source: Dict[str, Dict[str, float]] = {}
+    rows: List[Dict[str, object]] = []
+    for entry, grad_value in zip(tracked, score_grads):
+        raw_scores = entry["raw_scores"].detach().float().cpu()
+        if grad_value is None:
+            grad_cpu = torch.zeros_like(raw_scores)
+        else:
+            grad_cpu = grad_value.detach().float().cpu()
+        for idx, (src, raw_score_item, grad_item) in enumerate(zip(entry["source_labels"], raw_scores.tolist(), grad_cpu.tolist())):
+            src_key = str(src)
+            slot = by_source.setdefault(
+                src_key,
+                {
+                    "sum": 0.0,
+                    "sum_sq": 0.0,
+                    "sum_abs": 0.0,
+                    "count": 0,
+                    "positive": 0,
+                    "negative": 0,
+                },
+            )
+            grad_f = float(grad_item)
+            slot["sum"] += grad_f
+            slot["sum_sq"] += grad_f * grad_f
+            slot["sum_abs"] += abs(grad_f)
+            slot["count"] += 1
+            if grad_f > 0:
+                slot["positive"] += 1
+            elif grad_f < 0:
+                slot["negative"] += 1
+            rows.append(
+                {
+                    "inner_step_idx": int(entry["inner_step_idx"]),
+                    "sample_idx_in_batch": int(idx),
+                    "source": src_key,
+                    "raw_score": float(raw_score_item),
+                    "score_grad": grad_f,
+                }
+            )
+
+    by_source_final: Dict[str, Dict[str, float]] = {}
+    for src, stats in by_source.items():
+        count = max(int(stats["count"]), 1)
+        mean = float(stats["sum"] / count)
+        var = max(float(stats["sum_sq"] / count - mean * mean), 0.0)
+        by_source_final[src] = {
+            "mean_score_grad": mean,
+            "std_score_grad": float(var ** 0.5),
+            "mean_abs_score_grad": float(stats["sum_abs"] / count),
+            "frac_positive": float(stats["positive"] / count),
+            "frac_negative": float(stats["negative"] / count),
+            "count": int(stats["count"]),
+        }
+
+    return {
+        "by_source": by_source_final,
+        "rows": rows,
+    }
+
+
 def train_datarater(
     train_loader,
     val_loader,
@@ -1281,6 +1494,7 @@ def train_datarater(
     score_within_source_std_floor: float = 0.0,
     score_within_source_std_penalty_coef: float = 0.0,
     score_source_bias_penalty_coef: float = 0.0,
+    score_grad_log_interval: int = 0,
     outer_objective: str = "mse_norm",
     alpha: float = 0.5,
     outer_eps: float = 1e-8,
@@ -1361,6 +1575,8 @@ def train_datarater(
             raise ValueError("score_within_source_std_penalty_coef must be non-negative.")
         if score_source_bias_penalty_coef < 0.0:
             raise ValueError("score_source_bias_penalty_coef must be non-negative.")
+        if score_grad_log_interval < 0:
+            raise ValueError("score_grad_log_interval must be non-negative.")
         if inner_source_weight_cap:
             for src_name, cap_value in inner_source_weight_cap.items():
                 if float(cap_value) < 0.0:
@@ -1514,8 +1730,20 @@ def train_datarater(
             meta_source_log_path = os.path.join(meta_grad_log_dir or ".", "meta_source_metrics.jsonl")
             with open(meta_source_log_path, "w") as f:
                 f.write("")
+            if score_grad_log_interval > 0:
+                meta_score_grad_log_path = os.path.join(meta_grad_log_dir or ".", "meta_score_grad_metrics.jsonl")
+                meta_score_grad_samples_path = os.path.join(meta_grad_log_dir or ".", "meta_score_grad_samples.jsonl")
+                with open(meta_score_grad_log_path, "w") as f:
+                    f.write("")
+                with open(meta_score_grad_samples_path, "w") as f:
+                    f.write("")
+            else:
+                meta_score_grad_log_path = None
+                meta_score_grad_samples_path = None
         else:
             meta_source_log_path = None
+            meta_score_grad_log_path = None
+            meta_score_grad_samples_path = None
 
         if use_first_order_ablation:
             logger.warning(
@@ -1567,6 +1795,7 @@ def train_datarater(
                 "source_bias_penalty": [],
                 "total_penalty": [],
             }
+            score_grad_probe_payload = None
 
             shared_inner_batches = None
             if inner_batch_scope == "shared":
@@ -1604,6 +1833,12 @@ def train_datarater(
 
             for m_idx in models_to_process:
                 inner_model = population[m_idx]
+                probe_initial_fast_weights = None
+                if score_grad_log_interval > 0 and score_grad_probe_payload is None and ((step + 1) % int(score_grad_log_interval) == 0):
+                    probe_initial_fast_weights = {
+                        name: param.detach().clone()
+                        for name, param in inner_model.named_parameters()
+                    }
                 fast_weights = dict(inner_model.named_parameters())
 
                 if shared_inner_batches is None:
@@ -1613,6 +1848,7 @@ def train_datarater(
                         inner_batches.append(x_in)
                 else:
                     inner_batches = shared_inner_batches
+                inner_batches_for_probe = inner_batches
 
                 if datarater_arch == "moe" and shared_inner_batches is None:
                     for x_in in inner_batches:
@@ -1723,6 +1959,7 @@ def train_datarater(
                         x_out = _sample_outer_batch(outer_sampler)
                 else:
                     x_out = shared_outer_batch
+                outer_batch_for_probe = x_out
 
                 out_ids = x_out["input_ids"].to(device)
                 out_mask = x_out["attention_mask"].to(device)
@@ -1774,6 +2011,15 @@ def train_datarater(
                     allow_unused=True,
                 )
                 meta_grads_accumulator.append(meta_grads)
+
+                if score_grad_probe_payload is None and probe_initial_fast_weights is not None:
+                    score_grad_probe_payload = {
+                        "inner_model": inner_model,
+                        "initial_fast_weights": probe_initial_fast_weights,
+                        "inner_batches": inner_batches_for_probe,
+                        "outer_batch": outer_batch_for_probe,
+                        "inner_model_idx": int(m_idx),
+                    }
 
                 with torch.no_grad():
                     for name, param in inner_model.named_parameters():
@@ -1849,6 +2095,37 @@ def train_datarater(
                 outer_loss_delta_by_source or {},
             )
             prev_outer_loss_mean_by_source = dict(outer_loss_mean_by_source)
+            score_grad_diag_summary = None
+            if score_grad_probe_payload is not None and meta_score_grad_log_path is not None:
+                score_grad_diag_summary = _compute_score_grad_diagnostics(
+                    data_rater=data_rater,
+                    inner_model=score_grad_probe_payload["inner_model"],
+                    initial_fast_weights=score_grad_probe_payload["initial_fast_weights"],
+                    inner_batches=score_grad_probe_payload["inner_batches"],
+                    outer_batch=score_grad_probe_payload["outer_batch"],
+                    train_raw=train_raw,
+                    val_raw=val_raw,
+                    src2zscore=src2zscore,
+                    zscore_global_mean=zscore_global_mean,
+                    zscore_global_std=zscore_global_std,
+                    use_zscore_inner=use_zscore_inner,
+                    T_warmup=T_warmup,
+                    inner_lr=inner_lr,
+                    tau=tau,
+                    inner_weighting=inner_weighting,
+                    inner_source_score_bias=inner_source_score_bias,
+                    inner_source_weight_cap=inner_source_weight_cap,
+                    score_within_source_std_floor=score_within_source_std_floor,
+                    score_within_source_std_penalty_coef=score_within_source_std_penalty_coef,
+                    score_source_bias_penalty_coef=score_source_bias_penalty_coef,
+                    outer_objective=outer_objective,
+                    alpha=alpha,
+                    outer_eps=outer_eps,
+                    mse_norm_eps=mse_norm_eps,
+                    src2std=src2std,
+                    global_std=global_std,
+                    device=device,
+                )
 
             if meta_source_log_path:
                 with open(meta_source_log_path, "a") as f:
@@ -1873,6 +2150,22 @@ def train_datarater(
                         "weight_share_vs_outer_loss_delta_corr": weight_share_vs_outer_delta_corr,
                         "reset_events": list(reset_events),
                     }) + "\n")
+
+            if score_grad_diag_summary is not None:
+                with open(meta_score_grad_log_path, "a") as f:
+                    f.write(json.dumps({
+                        "step": int(step + 1),
+                        "inner_model_idx": int(score_grad_probe_payload["inner_model_idx"]),
+                        "by_source": score_grad_diag_summary["by_source"],
+                    }) + "\n")
+                with open(meta_score_grad_samples_path, "a") as f:
+                    for row in score_grad_diag_summary["rows"]:
+                        payload = {
+                            "step": int(step + 1),
+                            "inner_model_idx": int(score_grad_probe_payload["inner_model_idx"]),
+                        }
+                        payload.update(row)
+                        f.write(json.dumps(payload) + "\n")
 
             if (step + 1) % 50 == 0:
                 with torch.no_grad():

@@ -23,6 +23,7 @@ COMMON_ARGS=(
   --use_zscore_inner
   --meta_grad_clip 1.0
   --canary_interval 200
+  --score_grad_log_interval 100
   --random_baseline
   --random_mode stratified_ratio
   --datarater_arch single

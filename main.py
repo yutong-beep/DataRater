@@ -180,6 +180,8 @@ def parse_args():
                    help="Penalty coefficient for low within-source score spread")
     p.add_argument("--score_source_bias_penalty_coef", type=float, default=0.0,
                    help="Penalty coefficient for large source-level score mean offsets")
+    p.add_argument("--score_grad_log_interval", type=int, default=0,
+                   help="If >0, log per-sample raw-score gradient diagnostics every N meta-steps")
     p.add_argument("--outer_objective", type=str, default="mse_norm",
                    choices=["mse", "rmse", "mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"],
                    help="Outer-loop objective for meta-training")
@@ -1060,6 +1062,7 @@ def main():
             score_within_source_std_floor=args.score_within_source_std_floor,
             score_within_source_std_penalty_coef=args.score_within_source_std_penalty_coef,
             score_source_bias_penalty_coef=args.score_source_bias_penalty_coef,
+            score_grad_log_interval=args.score_grad_log_interval,
             outer_objective=args.outer_objective,
             alpha=args.alpha,
             outer_eps=args.outer_eps,
