@@ -13,6 +13,12 @@ from transformers import EsmModel
 from torch.func import functional_call
 
 from mixflow_mg import mixflow_inner_update
+from datarater_weighting import (
+    apply_source_score_bias,
+    apply_source_weight_cap,
+    compute_inner_weights,
+    compute_score_regularization,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1269,6 +1275,12 @@ def train_datarater(
     sample_one_inner: bool = False,
     inner_lr: float = 1e-4,
     tau: float = 0.5,
+    inner_weighting: str = "softmax",
+    inner_source_score_bias: Optional[Dict[str, float]] = None,
+    inner_source_weight_cap: Optional[Dict[str, float]] = None,
+    score_within_source_std_floor: float = 0.0,
+    score_within_source_std_penalty_coef: float = 0.0,
+    score_source_bias_penalty_coef: float = 0.0,
     outer_objective: str = "mse_norm",
     alpha: float = 0.5,
     outer_eps: float = 1e-8,
@@ -1333,6 +1345,8 @@ def train_datarater(
             raise ValueError("inner_batch_scope must be one of {'shared', 'per_inner'}.")
         if outer_batch_scope not in {"shared", "per_inner"}:
             raise ValueError("outer_batch_scope must be one of {'shared', 'per_inner'}.")
+        if inner_weighting not in {"softmax", "sigmoid_norm"}:
+            raise ValueError("inner_weighting must be one of {'softmax', 'sigmoid_norm'}.")
         if inner_reset_strategy not in {"random_init", "carryover", "checkpoint_bank"}:
             raise ValueError("inner_reset_strategy must be one of {'random_init', 'carryover', 'checkpoint_bank'}.")
         if router_aux_loss_coef < 0.0:
@@ -1341,6 +1355,16 @@ def train_datarater(
             raise ValueError("router_z_loss_coef must be non-negative.")
         if inner_init_bank_jitter < 0:
             raise ValueError("inner_init_bank_jitter must be non-negative.")
+        if score_within_source_std_floor < 0.0:
+            raise ValueError("score_within_source_std_floor must be non-negative.")
+        if score_within_source_std_penalty_coef < 0.0:
+            raise ValueError("score_within_source_std_penalty_coef must be non-negative.")
+        if score_source_bias_penalty_coef < 0.0:
+            raise ValueError("score_source_bias_penalty_coef must be non-negative.")
+        if inner_source_weight_cap:
+            for src_name, cap_value in inner_source_weight_cap.items():
+                if float(cap_value) < 0.0:
+                    raise ValueError(f"inner_source_weight_cap for {src_name} must be non-negative.")
         if datarater_arch == "moe" and router_noise_std > 0.0:
             logger.warning(
                 "[meta] p4-mixflow forces router_noise_std from %.4f to 0.0 so MixFlow recomputation stays deterministic.",
@@ -1353,7 +1377,7 @@ def train_datarater(
         T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
         logger.info(
             "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s, "
-            "inner_batch_scope=%s, outer_batch_scope=%s, inner_reset=%s",
+            "inner_batch_scope=%s, outer_batch_scope=%s, inner_reset=%s, inner_weighting=%s",
             T_window,
             T_backprop_eff,
             T_warmup,
@@ -1362,6 +1386,7 @@ def train_datarater(
             inner_batch_scope,
             outer_batch_scope,
             inner_reset_strategy,
+            inner_weighting,
         )
 
         src2std: Dict[str, float] = {}
@@ -1537,6 +1562,11 @@ def train_datarater(
             step_inner_score_stats: Dict[str, Dict[str, float]] = {}
             step_inner_weight_stats: Dict[str, Dict[str, float]] = {}
             step_outer_loss_stats: Dict[str, Dict[str, float]] = {}
+            step_score_reg_terms = {
+                "within_source_std_penalty": [],
+                "source_bias_penalty": [],
+                "total_penalty": [],
+            }
 
             shared_inner_batches = None
             if inner_batch_scope == "shared":
@@ -1627,8 +1657,19 @@ def train_datarater(
                         raw_indices=raw_index,
                         raw_dataset=train_raw,
                     )
-                    weights = F.softmax(raw_scores / tau, dim=0)
                     inner_source_labels = _raw_indices_to_source_labels(raw_index, train_raw)
+                    raw_scores = apply_source_score_bias(raw_scores, inner_source_labels, inner_source_score_bias)
+                    weights = compute_inner_weights(raw_scores, tau=tau, weighting_mode=inner_weighting)
+                    weights, _ = apply_source_weight_cap(weights, inner_source_labels, inner_source_weight_cap)
+                    score_reg_loss, score_reg_stats = compute_score_regularization(
+                        raw_scores,
+                        inner_source_labels,
+                        within_source_std_floor=score_within_source_std_floor,
+                        within_source_std_penalty_coef=score_within_source_std_penalty_coef,
+                        source_bias_penalty_coef=score_source_bias_penalty_coef,
+                    )
+                    for key in step_score_reg_terms:
+                        step_score_reg_terms[key].append(float(score_reg_stats[key]))
                     if inner_source_labels:
                         _accumulate_source_values(step_inner_score_stats, inner_source_labels, raw_scores)
                         _accumulate_source_values(step_inner_weight_stats, inner_source_labels, weights)
@@ -1637,7 +1678,7 @@ def train_datarater(
                         weights = weights.detach()
                         preds = functional_forward(inner_model, fast_weights, input_ids, mask)
                         per = F.mse_loss(preds.float(), targets.float(), reduction="none")
-                        inner_loss = torch.sum(weights.float() * per)
+                        inner_loss = torch.sum(weights.float() * per) + score_reg_loss
                         grads = torch.autograd.grad(
                             inner_loss,
                             tuple(fast_weights.values()),
@@ -1660,12 +1701,19 @@ def train_datarater(
                             attention_mask=mask,
                             targets=targets,
                             tau=tau,
+                            weighting_mode=inner_weighting,
                             inner_lr=inner_lr,
                             functional_forward_fn=functional_forward,
                             functional_datarater_forward_fn=functional_datarater_forward,
                             raw_indices=raw_index,
                             raw_dataset=train_raw,
                             precomputed_raw_scores=raw_scores,
+                            precomputed_source_labels=inner_source_labels,
+                            inner_source_score_bias=inner_source_score_bias,
+                            inner_source_weight_cap=inner_source_weight_cap,
+                            score_within_source_std_floor=score_within_source_std_floor,
+                            score_within_source_std_penalty_coef=score_within_source_std_penalty_coef,
+                            score_source_bias_penalty_coef=score_source_bias_penalty_coef,
                         )
 
                 if shared_outer_batch is None:
@@ -1783,6 +1831,10 @@ def train_datarater(
                 src: float(weight_sum / total_inner_weight)
                 for src, weight_sum in inner_weight_sum_by_source.items()
             } if total_inner_weight > 0.0 else {}
+            score_regularization = {
+                key: (float(sum(values) / len(values)) if values else 0.0)
+                for key, values in step_score_reg_terms.items()
+            }
             outer_loss_delta_by_source = None
             if prev_outer_loss_mean_by_source is not None:
                 shared_sources = sorted(set(prev_outer_loss_mean_by_source) & set(outer_loss_mean_by_source))
@@ -1813,6 +1865,7 @@ def train_datarater(
                         "inner_weight_sum_by_source": inner_weight_sum_by_source,
                         "inner_weight_count_by_source": inner_weight_count_by_source,
                         "inner_weight_share_by_source": inner_weight_share_by_source,
+                        "score_regularization": score_regularization,
                         "outer_loss_mean_by_source": outer_loss_mean_by_source,
                         "outer_loss_count_by_source": outer_loss_count_by_source,
                         "outer_loss_delta_by_source": outer_loss_delta_by_source,

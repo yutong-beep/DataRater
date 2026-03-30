@@ -167,6 +167,19 @@ def parse_args():
                    help="v2: Per-source z-score normalize inner targets to equalize source difficulty")
     p.add_argument("--temperature", type=float, default=0.5,
                    help="Softmax temperature tau used by DataRater in meta-training")
+    p.add_argument("--inner_weighting", type=str, default="softmax",
+                   choices=["softmax", "sigmoid_norm"],
+                   help="How DataRater scores are converted to inner-loop sample weights")
+    p.add_argument("--inner_source_score_bias", type=str, default="",
+                   help="Comma-separated source=bias spec applied to raw scores before inner weighting")
+    p.add_argument("--inner_source_weight_cap", type=str, default="",
+                   help="Comma-separated source=max_share spec applied after inner weighting")
+    p.add_argument("--score_within_source_std_floor", type=float, default=0.0,
+                   help="Minimum per-source score std encouraged inside each inner batch")
+    p.add_argument("--score_within_source_std_penalty_coef", type=float, default=0.0,
+                   help="Penalty coefficient for low within-source score spread")
+    p.add_argument("--score_source_bias_penalty_coef", type=float, default=0.0,
+                   help="Penalty coefficient for large source-level score mean offsets")
     p.add_argument("--outer_objective", type=str, default="mse_norm",
                    choices=["mse", "rmse", "mse_norm", "pearson", "cosine", "mix", "source_stratified_mse"],
                    help="Outer-loop objective for meta-training")
@@ -1015,6 +1028,8 @@ def main():
         from data_utils import build_dataloaders
         hard_outer_sources = _parse_csv_arg(args.hard_outer_sources)
         outer_source_weights = _parse_weight_spec(args.outer_source_weights)
+        inner_source_score_bias = _parse_weight_spec(args.inner_source_score_bias)
+        inner_source_weight_cap = _parse_weight_spec(args.inner_source_weight_cap)
         
         # Build specialized dataloaders with smaller meta_batch_size to prevent OOM
         logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
@@ -1039,6 +1054,12 @@ def main():
             T_window=args.T_window,
             T_backprop=args.T_backprop,
             temperature=args.temperature,
+            inner_weighting=args.inner_weighting,
+            inner_source_score_bias=inner_source_score_bias,
+            inner_source_weight_cap=inner_source_weight_cap,
+            score_within_source_std_floor=args.score_within_source_std_floor,
+            score_within_source_std_penalty_coef=args.score_within_source_std_penalty_coef,
+            score_source_bias_penalty_coef=args.score_source_bias_penalty_coef,
             outer_objective=args.outer_objective,
             alpha=args.alpha,
             outer_eps=args.outer_eps,

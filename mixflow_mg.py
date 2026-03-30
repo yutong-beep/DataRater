@@ -2,6 +2,13 @@ import torch
 import torch.nn.functional as F
 from torch.func import grad, jvp
 
+from datarater_weighting import (
+    apply_source_score_bias,
+    apply_source_weight_cap,
+    compute_inner_weights,
+    compute_score_regularization,
+)
+
 
 def _replace_none_with_zeros(values, refs):
     out = []
@@ -39,6 +46,13 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         attention_mask,
         targets,
         precomputed_raw_scores,
+        precomputed_source_labels,
+        weighting_mode,
+        inner_source_score_bias,
+        inner_source_weight_cap,
+        score_within_source_std_floor,
+        score_within_source_std_penalty_coef,
+        score_source_bias_penalty_coef,
         *all_values,
     ):
         num_fw = len(fast_weight_keys)
@@ -56,6 +70,13 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         ctx.num_fw = num_fw
         ctx.raw_indices = raw_indices.detach() if torch.is_tensor(raw_indices) else None
         ctx.raw_dataset = raw_dataset
+        ctx.precomputed_source_labels = list(precomputed_source_labels) if precomputed_source_labels is not None else None
+        ctx.weighting_mode = weighting_mode
+        ctx.inner_source_score_bias = dict(inner_source_score_bias) if inner_source_score_bias is not None else None
+        ctx.inner_source_weight_cap = dict(inner_source_weight_cap) if inner_source_weight_cap is not None else None
+        ctx.score_within_source_std_floor = float(score_within_source_std_floor)
+        ctx.score_within_source_std_penalty_coef = float(score_within_source_std_penalty_coef)
+        ctx.score_source_bias_penalty_coef = float(score_source_bias_penalty_coef)
 
         ctx.save_for_backward(
             input_ids,
@@ -83,11 +104,21 @@ class MixFlowMGInnerStep(torch.autograd.Function):
                 )
             else:
                 raw_scores = precomputed_raw_scores.detach()
-            weights = F.softmax(raw_scores / tau, dim=0)
+            source_labels = ctx.precomputed_source_labels or []
+            raw_scores = apply_source_score_bias(raw_scores, source_labels, ctx.inner_source_score_bias)
+            weights = compute_inner_weights(raw_scores, tau=tau, weighting_mode=weighting_mode)
+            weights, _ = apply_source_weight_cap(weights, source_labels, ctx.inner_source_weight_cap)
+            score_reg_loss, _ = compute_score_regularization(
+                raw_scores,
+                source_labels,
+                within_source_std_floor=ctx.score_within_source_std_floor,
+                within_source_std_penalty_coef=ctx.score_within_source_std_penalty_coef,
+                source_bias_penalty_coef=ctx.score_source_bias_penalty_coef,
+            )
 
             preds = functional_forward_fn(inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
-            inner_loss = torch.sum(weights.float() * per_sample_loss)
+            inner_loss = torch.sum(weights.float() * per_sample_loss) + score_reg_loss
 
             grads = torch.autograd.grad(
                 inner_loss,
@@ -128,11 +159,21 @@ class MixFlowMGInnerStep(torch.autograd.Function):
                 raw_indices=raw_indices,
                 raw_dataset=ctx.raw_dataset,
             )
-            weights = F.softmax(raw_scores / ctx.tau, dim=0)
+            source_labels = ctx.precomputed_source_labels or []
+            raw_scores = apply_source_score_bias(raw_scores, source_labels, ctx.inner_source_score_bias)
+            weights = compute_inner_weights(raw_scores, tau=ctx.tau, weighting_mode=ctx.weighting_mode)
+            weights, _ = apply_source_weight_cap(weights, source_labels, ctx.inner_source_weight_cap)
+            score_reg_loss, _ = compute_score_regularization(
+                raw_scores,
+                source_labels,
+                within_source_std_floor=ctx.score_within_source_std_floor,
+                within_source_std_penalty_coef=ctx.score_within_source_std_penalty_coef,
+                source_bias_penalty_coef=ctx.score_source_bias_penalty_coef,
+            )
 
             preds = ctx.functional_forward_fn(ctx.inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
-            return torch.sum(weights.float() * per_sample_loss)
+            return torch.sum(weights.float() * per_sample_loss) + score_reg_loss
 
         def grad_theta_fn(fw_tuple):
             return grad(compute_inner_loss, argnums=0)(fw_tuple, rater_base)
@@ -157,24 +198,7 @@ class MixFlowMGInnerStep(torch.autograd.Function):
         grad_fw = tuple(v_i - ctx.inner_lr * h_i for v_i, h_i in zip(v, h_theta_v))
         grad_rater = tuple(-ctx.inner_lr * h_i for h_i in h_eta_v)
 
-        return (
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            *grad_fw,
-            *grad_rater,
-        )
+        return (None,) * 21 + grad_fw + grad_rater
 
 
 def mixflow_inner_update(
@@ -185,12 +209,19 @@ def mixflow_inner_update(
     attention_mask,
     targets,
     tau,
+    weighting_mode,
     inner_lr,
     functional_forward_fn,
     functional_datarater_forward_fn,
     raw_indices=None,
     raw_dataset=None,
     precomputed_raw_scores=None,
+    precomputed_source_labels=None,
+    inner_source_score_bias=None,
+    inner_source_weight_cap=None,
+    score_within_source_std_floor: float = 0.0,
+    score_within_source_std_penalty_coef: float = 0.0,
+    score_source_bias_penalty_coef: float = 0.0,
 ):
     fast_weight_keys = tuple(fast_weights.keys())
     fw_values = tuple(fast_weights.values())
@@ -214,6 +245,13 @@ def mixflow_inner_update(
         attention_mask,
         targets,
         precomputed_raw_scores,
+        precomputed_source_labels,
+        weighting_mode,
+        inner_source_score_bias,
+        inner_source_weight_cap,
+        score_within_source_std_floor,
+        score_within_source_std_penalty_coef,
+        score_source_bias_penalty_coef,
         *fw_values,
         *rater_values,
     )
