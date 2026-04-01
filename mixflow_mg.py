@@ -6,7 +6,6 @@ from datarater_weighting import (
     apply_source_score_bias,
     apply_source_weight_cap,
     compute_inner_weights,
-    compute_score_regularization,
 )
 
 
@@ -108,17 +107,9 @@ class MixFlowMGInnerStep(torch.autograd.Function):
             raw_scores = apply_source_score_bias(raw_scores, source_labels, ctx.inner_source_score_bias)
             weights = compute_inner_weights(raw_scores, tau=tau, weighting_mode=weighting_mode)
             weights, _ = apply_source_weight_cap(weights, source_labels, ctx.inner_source_weight_cap)
-            score_reg_loss, _ = compute_score_regularization(
-                raw_scores,
-                source_labels,
-                within_source_std_floor=ctx.score_within_source_std_floor,
-                within_source_std_penalty_coef=ctx.score_within_source_std_penalty_coef,
-                source_bias_penalty_coef=ctx.score_source_bias_penalty_coef,
-            )
-
             preds = functional_forward_fn(inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
-            inner_loss = torch.sum(weights.float() * per_sample_loss) + score_reg_loss
+            inner_loss = torch.sum(weights.float() * per_sample_loss)
 
             grads = torch.autograd.grad(
                 inner_loss,
@@ -163,17 +154,9 @@ class MixFlowMGInnerStep(torch.autograd.Function):
             raw_scores = apply_source_score_bias(raw_scores, source_labels, ctx.inner_source_score_bias)
             weights = compute_inner_weights(raw_scores, tau=ctx.tau, weighting_mode=ctx.weighting_mode)
             weights, _ = apply_source_weight_cap(weights, source_labels, ctx.inner_source_weight_cap)
-            score_reg_loss, _ = compute_score_regularization(
-                raw_scores,
-                source_labels,
-                within_source_std_floor=ctx.score_within_source_std_floor,
-                within_source_std_penalty_coef=ctx.score_within_source_std_penalty_coef,
-                source_bias_penalty_coef=ctx.score_source_bias_penalty_coef,
-            )
-
             preds = ctx.functional_forward_fn(ctx.inner_model, fw_dict, input_ids, attention_mask)
             per_sample_loss = F.mse_loss(preds.float(), targets.float(), reduction="none")
-            return torch.sum(weights.float() * per_sample_loss) + score_reg_loss
+            return torch.sum(weights.float() * per_sample_loss)
 
         def grad_theta_fn(fw_tuple):
             return grad(compute_inner_loss, argnums=0)(fw_tuple, rater_base)

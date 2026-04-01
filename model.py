@@ -1349,6 +1349,7 @@ def _compute_score_grad_diagnostics(
         for name, value in initial_fast_weights.items()
     }
     tracked: List[Dict[str, object]] = []
+    accum_score_reg = None
 
     for inner_step_idx, x_in in enumerate(inner_batches):
         input_ids = x_in["input_ids"].to(device)
@@ -1387,6 +1388,7 @@ def _compute_score_grad_diagnostics(
             within_source_std_penalty_coef=score_within_source_std_penalty_coef,
             source_bias_penalty_coef=score_source_bias_penalty_coef,
         )
+        accum_score_reg = score_reg_loss if accum_score_reg is None else (accum_score_reg + score_reg_loss)
 
         preds = functional_forward(inner_model, fast_weights, input_ids, mask)
         per = F.mse_loss(preds.float(), targets.float(), reduction="none")
@@ -1400,7 +1402,7 @@ def _compute_score_grad_diagnostics(
             )
             grads = [g.detach() if g is not None else None for g in grads]
         else:
-            inner_loss = torch.sum(weights.float() * per) + score_reg_loss
+            inner_loss = torch.sum(weights.float() * per)
             grads = torch.autograd.grad(
                 inner_loss,
                 tuple(fast_weights.values()),
@@ -1460,8 +1462,12 @@ def _compute_score_grad_diagnostics(
     )
 
     grad_targets = [entry["raw_scores"] for entry in tracked]
+    total_outer_loss = outer_loss + (
+        accum_score_reg if accum_score_reg is not None else outer_loss.new_zeros(())
+    )
+
     score_grads = torch.autograd.grad(
-        outer_loss,
+        total_outer_loss,
         grad_targets,
         retain_graph=False,
         allow_unused=True,
@@ -1946,6 +1952,7 @@ def train_datarater(
                         for name, param in inner_model.named_parameters()
                     }
                 fast_weights = dict(inner_model.named_parameters())
+                accum_score_reg = None
 
                 if shared_inner_batches is None:
                     inner_batches = []
@@ -2000,7 +2007,8 @@ def train_datarater(
                         raw_dataset=train_raw,
                     )
                     inner_source_labels = _raw_indices_to_source_labels(raw_index, train_raw)
-                    raw_scores = apply_source_score_bias(raw_scores, inner_source_labels, inner_source_score_bias)
+                    raw_scores_unbiased = raw_scores
+                    raw_scores = apply_source_score_bias(raw_scores_unbiased, inner_source_labels, inner_source_score_bias)
                     weights = compute_inner_weights(raw_scores, tau=tau, weighting_mode=inner_weighting)
                     weights, _ = apply_source_weight_cap(weights, inner_source_labels, inner_source_weight_cap)
                     score_reg_loss, score_reg_stats = compute_score_regularization(
@@ -2010,6 +2018,7 @@ def train_datarater(
                         within_source_std_penalty_coef=score_within_source_std_penalty_coef,
                         source_bias_penalty_coef=score_source_bias_penalty_coef,
                     )
+                    accum_score_reg = score_reg_loss if accum_score_reg is None else (accum_score_reg + score_reg_loss)
                     for key in step_score_reg_terms:
                         step_score_reg_terms[key].append(float(score_reg_stats[key]))
                     if inner_source_labels:
@@ -2020,7 +2029,7 @@ def train_datarater(
                         weights = weights.detach()
                         preds = functional_forward(inner_model, fast_weights, input_ids, mask)
                         per = F.mse_loss(preds.float(), targets.float(), reduction="none")
-                        inner_loss = torch.sum(weights.float() * per) + score_reg_loss
+                        inner_loss = torch.sum(weights.float() * per)
                         grads = torch.autograd.grad(
                             inner_loss,
                             tuple(fast_weights.values()),
@@ -2049,7 +2058,7 @@ def train_datarater(
                             functional_datarater_forward_fn=functional_datarater_forward,
                             raw_indices=raw_index,
                             raw_dataset=train_raw,
-                            precomputed_raw_scores=raw_scores,
+                            precomputed_raw_scores=raw_scores_unbiased,
                             precomputed_source_labels=inner_source_labels,
                             inner_source_score_bias=inner_source_score_bias,
                             inner_source_weight_cap=inner_source_weight_cap,
@@ -2111,8 +2120,12 @@ def train_datarater(
                 )
                 outer_loss_values.append(float(outer_loss.detach().item()))
 
+                total_outer_loss = outer_loss + (
+                    accum_score_reg if accum_score_reg is not None else outer_loss.new_zeros(())
+                )
+
                 meta_grads = torch.autograd.grad(
-                    outer_loss,
+                    total_outer_loss,
                     params,
                     allow_unused=True,
                 )
