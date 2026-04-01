@@ -28,6 +28,7 @@ def run_meta_training(
     train_raw,
     val_raw,
     train_dataset=None,
+    meta_lr: float = 1e-4,
     n_meta_steps: int = 5000,
     n_inner_models: int = 8,
     lifetime: int = 2000,
@@ -57,6 +58,9 @@ def run_meta_training(
     outer_schedule_first_frac: float = 1.0 / 3.0,
     outer_schedule_first_source_weights: Optional[Dict[str, float]] = None,
     outer_schedule_second_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule_cycle_interval: int = 200,
+    outer_schedule_cycle_sources: Optional[Sequence[str]] = None,
+    outer_schedule_second_lr_scale: float = 1.0,
     inner_batch_scope: str = "shared",
     outer_batch_scope: str = "shared",
     meta_grad_clip: Optional[float] = None,
@@ -90,6 +94,7 @@ def run_meta_training(
 
     config = {
         "n_meta_steps": n_meta_steps,
+        "meta_lr": meta_lr,
         "n_inner_models": n_inner_models,
         "lifetime": lifetime,
         "T_window": T_window,
@@ -122,6 +127,11 @@ def run_meta_training(
         "outer_schedule_second_source_weights": (
             dict(outer_schedule_second_source_weights) if outer_schedule_second_source_weights is not None else None
         ),
+        "outer_schedule_cycle_interval": outer_schedule_cycle_interval,
+        "outer_schedule_cycle_sources": (
+            list(outer_schedule_cycle_sources) if outer_schedule_cycle_sources is not None else None
+        ),
+        "outer_schedule_second_lr_scale": outer_schedule_second_lr_scale,
         "inner_batch_scope": inner_batch_scope,
         "outer_batch_scope": outer_batch_scope,
         "meta_grad_clip": meta_grad_clip,
@@ -155,6 +165,7 @@ def run_meta_training(
     data_rater = train_datarater(
         train_loader=train_loader,
         val_loader=val_loader,
+        meta_lr=meta_lr,
         n_meta_steps=n_meta_steps,
         n_inner_models=n_inner_models,
         lifetime=lifetime,
@@ -186,6 +197,9 @@ def run_meta_training(
         outer_schedule_first_frac=outer_schedule_first_frac,
         outer_schedule_first_source_weights=outer_schedule_first_source_weights,
         outer_schedule_second_source_weights=outer_schedule_second_source_weights,
+        outer_schedule_cycle_interval=outer_schedule_cycle_interval,
+        outer_schedule_cycle_sources=outer_schedule_cycle_sources,
+        outer_schedule_second_lr_scale=outer_schedule_second_lr_scale,
         inner_batch_scope=inner_batch_scope,
         outer_batch_scope=outer_batch_scope,
         meta_grad_clip=meta_grad_clip,

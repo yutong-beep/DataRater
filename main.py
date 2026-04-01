@@ -219,7 +219,7 @@ def parse_args():
     p.add_argument("--outer_source_weights", type=str, default="",
                    help="Comma-separated source=weight spec used when --outer_sampling custom_ratio")
     p.add_argument("--outer_schedule", type=str, default="none",
-                   choices=["none", "two_stage_custom_ratio"],
+                   choices=["none", "two_stage_custom_ratio", "cycle_single_source"],
                    help="Optional schedule that changes outer sampling over meta-steps")
     p.add_argument("--outer_schedule_first_frac", type=float, default=1.0 / 3.0,
                    help="Fraction of meta-steps assigned to the first outer-schedule stage")
@@ -227,6 +227,12 @@ def parse_args():
                    help="Comma-separated source=weight spec for stage 1 when --outer_schedule two_stage_custom_ratio")
     p.add_argument("--outer_schedule_second_source_weights", type=str, default="",
                    help="Comma-separated source=weight spec for stage 2 when --outer_schedule two_stage_custom_ratio")
+    p.add_argument("--outer_schedule_cycle_interval", type=int, default=200,
+                   help="Meta-step interval used when --outer_schedule cycle_single_source")
+    p.add_argument("--outer_schedule_cycle_sources", type=str, default="",
+                   help="Comma-separated source names used by --outer_schedule cycle_single_source")
+    p.add_argument("--outer_schedule_second_lr_scale", type=float, default=1.0,
+                   help="Optional LR multiplier applied during stage2 of --outer_schedule two_stage_custom_ratio")
     p.add_argument("--inner_batch_scope", type=str, default="shared",
                    choices=["shared", "per_inner"],
                    help="Whether inner models share the same inner batches within a meta-step")
@@ -1061,6 +1067,7 @@ def main():
             train_raw=train_raw_dataset,
             val_raw=val_raw_dataset,
             train_dataset=train_dataset,
+            meta_lr=args.lr,
             n_meta_steps=args.meta_steps,
             n_inner_models=args.n_inner_models,
             lifetime=args.lifetime,
@@ -1095,6 +1102,9 @@ def main():
             outer_schedule_first_frac=args.outer_schedule_first_frac,
             outer_schedule_first_source_weights=outer_schedule_first_source_weights,
             outer_schedule_second_source_weights=outer_schedule_second_source_weights,
+            outer_schedule_cycle_interval=args.outer_schedule_cycle_interval,
+            outer_schedule_cycle_sources=_parse_csv_arg(args.outer_schedule_cycle_sources),
+            outer_schedule_second_lr_scale=args.outer_schedule_second_lr_scale,
             inner_batch_scope=args.inner_batch_scope,
             outer_batch_scope=args.outer_batch_scope,
             num_experts=args.num_experts,

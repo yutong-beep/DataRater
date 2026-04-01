@@ -905,6 +905,9 @@ def _resolve_outer_schedule_for_step(
     outer_schedule_first_frac: float,
     outer_schedule_first_source_weights: Optional[Dict[str, float]],
     outer_schedule_second_source_weights: Optional[Dict[str, float]],
+    outer_schedule_cycle_interval: int,
+    outer_schedule_cycle_sources: Optional[Sequence[str]],
+    outer_schedule_second_lr_scale: float,
 ):
     if outer_schedule == "none":
         return outer_sampling, outer_source_weights, None
@@ -923,6 +926,28 @@ def _resolve_outer_schedule_for_step(
                 "stage": stage_name,
                 "progress": progress,
                 "first_frac": first_frac,
+                "lr_scale": 1.0 if stage_name == "stage1" else float(outer_schedule_second_lr_scale),
+            },
+        )
+
+    if outer_schedule == "cycle_single_source":
+        cycle_sources = [str(x) for x in (outer_schedule_cycle_sources or []) if str(x)]
+        if not cycle_sources:
+            raise ValueError("outer_schedule='cycle_single_source' requires outer_schedule_cycle_sources.")
+        interval = max(int(outer_schedule_cycle_interval), 1)
+        cycle_idx = (int(step) // interval) % len(cycle_sources)
+        active_source = cycle_sources[cycle_idx]
+        return (
+            "custom_ratio",
+            {active_source: 1.0},
+            {
+                "schedule": outer_schedule,
+                "stage": f"cycle_{cycle_idx}",
+                "progress": progress,
+                "cycle_idx": cycle_idx,
+                "cycle_interval": interval,
+                "active_source": active_source,
+                "lr_scale": 1.0,
             },
         )
 
@@ -1536,6 +1561,7 @@ def _compute_score_grad_diagnostics(
 def train_datarater(
     train_loader,
     val_loader,
+    meta_lr: float = 1e-4,
     n_meta_steps: int = 5000,
     n_inner_models: int = 8,
     lifetime: int = 2000,
@@ -1572,6 +1598,9 @@ def train_datarater(
     outer_schedule_first_frac: float = 1.0 / 3.0,
     outer_schedule_first_source_weights: Optional[Dict[str, float]] = None,
     outer_schedule_second_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule_cycle_interval: int = 200,
+    outer_schedule_cycle_sources: Optional[Sequence[str]] = None,
+    outer_schedule_second_lr_scale: float = 1.0,
     inner_batch_scope: str = "shared",
     outer_batch_scope: str = "shared",
     meta_grad_clip: Optional[float] = None,
@@ -1616,8 +1645,8 @@ def train_datarater(
             raise ValueError(
                 "outer_sampling must be one of {'random', 'balanced', 'harder', 'dataset_ratio', 'custom_ratio'}."
             )
-        if outer_schedule not in {"none", "two_stage_custom_ratio"}:
-            raise ValueError("outer_schedule must be one of {'none', 'two_stage_custom_ratio'}.")
+        if outer_schedule not in {"none", "two_stage_custom_ratio", "cycle_single_source"}:
+            raise ValueError("outer_schedule must be one of {'none', 'two_stage_custom_ratio', 'cycle_single_source'}.")
         if not (0.0 <= float(outer_schedule_first_frac) <= 1.0):
             raise ValueError("outer_schedule_first_frac must be in [0, 1].")
         if outer_schedule == "two_stage_custom_ratio":
@@ -1631,6 +1660,15 @@ def train_datarater(
                 raise ValueError(
                     "outer_schedule='two_stage_custom_ratio' requires outer_schedule_second_source_weights."
                 )
+        if outer_schedule == "cycle_single_source":
+            if outer_sampling != "custom_ratio":
+                raise ValueError("outer_schedule='cycle_single_source' requires outer_sampling='custom_ratio'.")
+            if not outer_schedule_cycle_sources:
+                raise ValueError("outer_schedule='cycle_single_source' requires outer_schedule_cycle_sources.")
+            if int(outer_schedule_cycle_interval) <= 0:
+                raise ValueError("outer_schedule_cycle_interval must be positive.")
+        if float(outer_schedule_second_lr_scale) <= 0.0:
+            raise ValueError("outer_schedule_second_lr_scale must be positive.")
         if inner_batch_scope not in {"shared", "per_inner"}:
             raise ValueError("inner_batch_scope must be one of {'shared', 'per_inner'}.")
         if outer_batch_scope not in {"shared", "per_inner"}:
@@ -1749,7 +1787,7 @@ def train_datarater(
             moe_score_merge=moe_score_merge,
             drop_overflow_tokens=drop_overflow_tokens,
         ).to(device)
-        rater_opt = torch.optim.Adam(data_rater.parameters(), lr=1e-4)
+        rater_opt = torch.optim.Adam(data_rater.parameters(), lr=float(meta_lr))
 
         # Inner population (heavy)
         population = [
@@ -1802,6 +1840,9 @@ def train_datarater(
                 outer_schedule_first_frac=outer_schedule_first_frac,
                 outer_schedule_first_source_weights=outer_schedule_first_source_weights,
                 outer_schedule_second_source_weights=outer_schedule_second_source_weights,
+                outer_schedule_cycle_interval=outer_schedule_cycle_interval,
+                outer_schedule_cycle_sources=outer_schedule_cycle_sources,
+                outer_schedule_second_lr_scale=outer_schedule_second_lr_scale,
             )
             sampler_key = _outer_sampler_cache_key(
                 outer_sampling=current_sampling,
@@ -1851,12 +1892,27 @@ def train_datarater(
 
         data_rater.train()
         prev_outer_loss_mean_by_source: Optional[Dict[str, float]] = None
+        prev_meta_lr_scale: Optional[float] = None
 
         for step in range(n_meta_steps):
             current_outer_sampler, current_outer_sampling, current_outer_source_weights, outer_schedule_info = get_outer_sampler_for_step(step)
             current_outer_schedule_stage_name = (
                 outer_schedule_info["stage"] if outer_schedule_info is not None else None
             )
+            current_meta_lr_scale = float(
+                outer_schedule_info.get("lr_scale", 1.0) if outer_schedule_info is not None else 1.0
+            )
+            if prev_meta_lr_scale != current_meta_lr_scale:
+                current_meta_lr = float(meta_lr) * current_meta_lr_scale
+                for group in rater_opt.param_groups:
+                    group["lr"] = current_meta_lr
+                logger.info(
+                    "[meta] step %d DataRater lr -> %.6g (scale=%.3f)",
+                    step + 1,
+                    current_meta_lr,
+                    current_meta_lr_scale,
+                )
+                prev_meta_lr_scale = current_meta_lr_scale
             if current_outer_schedule_stage_name != prev_outer_schedule_stage_name:
                 logger.info(
                     "[meta] step %d outer schedule stage -> %s | sampling=%s | weights=%s",
