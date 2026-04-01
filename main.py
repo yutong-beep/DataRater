@@ -218,6 +218,15 @@ def parse_args():
                    help="Comma-separated source names used when --outer_sampling harder")
     p.add_argument("--outer_source_weights", type=str, default="",
                    help="Comma-separated source=weight spec used when --outer_sampling custom_ratio")
+    p.add_argument("--outer_schedule", type=str, default="none",
+                   choices=["none", "two_stage_custom_ratio"],
+                   help="Optional schedule that changes outer sampling over meta-steps")
+    p.add_argument("--outer_schedule_first_frac", type=float, default=1.0 / 3.0,
+                   help="Fraction of meta-steps assigned to the first outer-schedule stage")
+    p.add_argument("--outer_schedule_first_source_weights", type=str, default="",
+                   help="Comma-separated source=weight spec for stage 1 when --outer_schedule two_stage_custom_ratio")
+    p.add_argument("--outer_schedule_second_source_weights", type=str, default="",
+                   help="Comma-separated source=weight spec for stage 2 when --outer_schedule two_stage_custom_ratio")
     p.add_argument("--inner_batch_scope", type=str, default="shared",
                    choices=["shared", "per_inner"],
                    help="Whether inner models share the same inner batches within a meta-step")
@@ -1030,6 +1039,8 @@ def main():
         from data_utils import build_dataloaders
         hard_outer_sources = _parse_csv_arg(args.hard_outer_sources)
         outer_source_weights = _parse_weight_spec(args.outer_source_weights)
+        outer_schedule_first_source_weights = _parse_weight_spec(args.outer_schedule_first_source_weights)
+        outer_schedule_second_source_weights = _parse_weight_spec(args.outer_schedule_second_source_weights)
         inner_source_score_bias = _parse_weight_spec(args.inner_source_score_bias)
         inner_source_weight_cap = _parse_weight_spec(args.inner_source_weight_cap)
         
@@ -1080,6 +1091,10 @@ def main():
             outer_per_source=args.outer_per_source,
             hard_outer_sources=hard_outer_sources,
             outer_source_weights=outer_source_weights,
+            outer_schedule=args.outer_schedule,
+            outer_schedule_first_frac=args.outer_schedule_first_frac,
+            outer_schedule_first_source_weights=outer_schedule_first_source_weights,
+            outer_schedule_second_source_weights=outer_schedule_second_source_weights,
             inner_batch_scope=args.inner_batch_scope,
             outer_batch_scope=args.outer_batch_scope,
             num_experts=args.num_experts,

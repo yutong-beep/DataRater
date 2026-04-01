@@ -878,6 +878,57 @@ def _sample_outer_batch(outer_sampler):
     return outer_sampler["collate_fn"](samples)
 
 
+def _outer_sampler_cache_key(
+    outer_sampling: str,
+    outer_per_source: Optional[int],
+    hard_outer_sources: Optional[Sequence[str]],
+    outer_source_weights: Optional[Dict[str, float]],
+):
+    weights_key = None
+    if outer_source_weights is not None:
+        weights_key = tuple(sorted((str(src), float(weight)) for src, weight in outer_source_weights.items()))
+    hard_sources_key = tuple(hard_outer_sources) if hard_outer_sources is not None else None
+    return (
+        str(outer_sampling),
+        None if outer_per_source is None else int(outer_per_source),
+        hard_sources_key,
+        weights_key,
+    )
+
+
+def _resolve_outer_schedule_for_step(
+    step: int,
+    n_meta_steps: int,
+    outer_sampling: str,
+    outer_source_weights: Optional[Dict[str, float]],
+    outer_schedule: str,
+    outer_schedule_first_frac: float,
+    outer_schedule_first_source_weights: Optional[Dict[str, float]],
+    outer_schedule_second_source_weights: Optional[Dict[str, float]],
+):
+    if outer_schedule == "none":
+        return outer_sampling, outer_source_weights, None
+
+    progress = float(step) / float(max(1, n_meta_steps))
+    first_frac = min(max(float(outer_schedule_first_frac), 0.0), 1.0)
+
+    if outer_schedule == "two_stage_custom_ratio":
+        stage_name = "stage1" if progress < first_frac else "stage2"
+        stage_weights = outer_schedule_first_source_weights if stage_name == "stage1" else outer_schedule_second_source_weights
+        return (
+            "custom_ratio",
+            dict(stage_weights or {}),
+            {
+                "schedule": outer_schedule,
+                "stage": stage_name,
+                "progress": progress,
+                "first_frac": first_frac,
+            },
+        )
+
+    raise ValueError(f"Unsupported outer_schedule mode: {outer_schedule}")
+
+
 def _next_batch(batch_iter, loader):
     try:
         batch = next(batch_iter)
@@ -1511,6 +1562,10 @@ def train_datarater(
     outer_per_source: Optional[int] = None,
     hard_outer_sources: Optional[Sequence[str]] = None,
     outer_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule: str = "none",
+    outer_schedule_first_frac: float = 1.0 / 3.0,
+    outer_schedule_first_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule_second_source_weights: Optional[Dict[str, float]] = None,
     inner_batch_scope: str = "shared",
     outer_batch_scope: str = "shared",
     meta_grad_clip: Optional[float] = None,
@@ -1555,6 +1610,21 @@ def train_datarater(
             raise ValueError(
                 "outer_sampling must be one of {'random', 'balanced', 'harder', 'dataset_ratio', 'custom_ratio'}."
             )
+        if outer_schedule not in {"none", "two_stage_custom_ratio"}:
+            raise ValueError("outer_schedule must be one of {'none', 'two_stage_custom_ratio'}.")
+        if not (0.0 <= float(outer_schedule_first_frac) <= 1.0):
+            raise ValueError("outer_schedule_first_frac must be in [0, 1].")
+        if outer_schedule == "two_stage_custom_ratio":
+            if outer_sampling != "custom_ratio":
+                raise ValueError("outer_schedule='two_stage_custom_ratio' requires outer_sampling='custom_ratio'.")
+            if not outer_schedule_first_source_weights:
+                raise ValueError(
+                    "outer_schedule='two_stage_custom_ratio' requires outer_schedule_first_source_weights."
+                )
+            if not outer_schedule_second_source_weights:
+                raise ValueError(
+                    "outer_schedule='two_stage_custom_ratio' requires outer_schedule_second_source_weights."
+                )
         if inner_batch_scope not in {"shared", "per_inner"}:
             raise ValueError("inner_batch_scope must be one of {'shared', 'per_inner'}.")
         if outer_batch_scope not in {"shared", "per_inner"}:
@@ -1593,12 +1663,13 @@ def train_datarater(
         T_warmup = T_window - T_backprop_eff  # Warmup steps are detached (no graph construction)
         logger.info(
             "[meta-v2] T_window=%d, T_backprop=%d, T_warmup=%d, datarater_arch=%s, outer_sampling=%s, "
-            "inner_batch_scope=%s, outer_batch_scope=%s, inner_reset=%s, inner_weighting=%s",
+            "outer_schedule=%s, inner_batch_scope=%s, outer_batch_scope=%s, inner_reset=%s, inner_weighting=%s",
             T_window,
             T_backprop_eff,
             T_warmup,
             datarater_arch,
             outer_sampling,
+            outer_schedule,
             inner_batch_scope,
             outer_batch_scope,
             inner_reset_strategy,
@@ -1712,14 +1783,36 @@ def train_datarater(
 
         train_iter = iter(train_loader)
         val_iter = iter(val_loader)
-        outer_sampler = _build_outer_sampler(
-            val_loader=val_loader,
-            val_raw=val_raw,
-            outer_sampling=outer_sampling,
-            outer_per_source=outer_per_source,
-            hard_outer_sources=hard_outer_sources,
-            outer_source_weights=outer_source_weights,
-        )
+        outer_sampler_cache: Dict[tuple, Optional[Dict[str, object]]] = {}
+        prev_outer_schedule_stage_name: Optional[str] = None
+
+        def get_outer_sampler_for_step(current_step: int):
+            current_sampling, current_weights, schedule_info = _resolve_outer_schedule_for_step(
+                step=current_step,
+                n_meta_steps=n_meta_steps,
+                outer_sampling=outer_sampling,
+                outer_source_weights=outer_source_weights,
+                outer_schedule=outer_schedule,
+                outer_schedule_first_frac=outer_schedule_first_frac,
+                outer_schedule_first_source_weights=outer_schedule_first_source_weights,
+                outer_schedule_second_source_weights=outer_schedule_second_source_weights,
+            )
+            sampler_key = _outer_sampler_cache_key(
+                outer_sampling=current_sampling,
+                outer_per_source=outer_per_source,
+                hard_outer_sources=hard_outer_sources,
+                outer_source_weights=current_weights,
+            )
+            if sampler_key not in outer_sampler_cache:
+                outer_sampler_cache[sampler_key] = _build_outer_sampler(
+                    val_loader=val_loader,
+                    val_raw=val_raw,
+                    outer_sampling=current_sampling,
+                    outer_per_source=outer_per_source,
+                    hard_outer_sources=hard_outer_sources,
+                    outer_source_weights=current_weights,
+                )
+            return outer_sampler_cache[sampler_key], current_sampling, current_weights, schedule_info
 
         if meta_grad_log_path:
             meta_grad_log_dir = os.path.dirname(meta_grad_log_path)
@@ -1754,6 +1847,19 @@ def train_datarater(
         prev_outer_loss_mean_by_source: Optional[Dict[str, float]] = None
 
         for step in range(n_meta_steps):
+            current_outer_sampler, current_outer_sampling, current_outer_source_weights, outer_schedule_info = get_outer_sampler_for_step(step)
+            current_outer_schedule_stage_name = (
+                outer_schedule_info["stage"] if outer_schedule_info is not None else None
+            )
+            if current_outer_schedule_stage_name != prev_outer_schedule_stage_name:
+                logger.info(
+                    "[meta] step %d outer schedule stage -> %s | sampling=%s | weights=%s",
+                    step + 1,
+                    current_outer_schedule_stage_name or "base",
+                    current_outer_sampling,
+                    current_outer_source_weights,
+                )
+                prev_outer_schedule_stage_name = current_outer_schedule_stage_name
             # staggered resets
             reset_events = []
             for i, inner_model in enumerate(population):
@@ -1806,10 +1912,10 @@ def train_datarater(
 
             shared_outer_batch = None
             if outer_batch_scope == "shared":
-                if outer_sampling == "random":
+                if current_outer_sampling == "random":
                     shared_outer_batch, val_iter = _next_batch(val_iter, val_loader)
                 else:
-                    shared_outer_batch = _sample_outer_batch(outer_sampler)
+                    shared_outer_batch = _sample_outer_batch(current_outer_sampler)
 
             if datarater_arch == "moe" and shared_inner_batches is not None:
                 for x_in in shared_inner_batches:
@@ -1953,10 +2059,10 @@ def train_datarater(
                         )
 
                 if shared_outer_batch is None:
-                    if outer_sampling == "random":
+                    if current_outer_sampling == "random":
                         x_out, val_iter = _next_batch(val_iter, val_loader)
                     else:
-                        x_out = _sample_outer_batch(outer_sampler)
+                        x_out = _sample_outer_batch(current_outer_sampler)
                 else:
                     x_out = shared_outer_batch
                 outer_batch_for_probe = x_out
@@ -2133,6 +2239,10 @@ def train_datarater(
                         "step": int(step + 1),
                         "outer_objective": outer_objective,
                         "outer_sampling": outer_sampling,
+                        "effective_outer_sampling": current_outer_sampling,
+                        "effective_outer_source_weights": current_outer_source_weights,
+                        "outer_schedule": outer_schedule,
+                        "outer_schedule_info": outer_schedule_info,
                         "inner_batch_scope": inner_batch_scope,
                         "outer_batch_scope": outer_batch_scope,
                         "models_processed": int(len(models_to_process)),
@@ -2211,6 +2321,10 @@ def train_datarater(
                             "inner_batch_scope": inner_batch_scope,
                             "outer_batch_scope": outer_batch_scope,
                             "outer_sampling": outer_sampling,
+                            "effective_outer_sampling": current_outer_sampling,
+                            "effective_outer_source_weights": current_outer_source_weights,
+                            "outer_schedule": outer_schedule,
+                            "outer_schedule_info": outer_schedule_info,
                             "reset_events": list(reset_events),
                         }) + "\n")
 

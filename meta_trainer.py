@@ -53,6 +53,10 @@ def run_meta_training(
     outer_per_source: Optional[int] = None,
     hard_outer_sources: Optional[Sequence[str]] = None,
     outer_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule: str = "none",
+    outer_schedule_first_frac: float = 1.0 / 3.0,
+    outer_schedule_first_source_weights: Optional[Dict[str, float]] = None,
+    outer_schedule_second_source_weights: Optional[Dict[str, float]] = None,
     inner_batch_scope: str = "shared",
     outer_batch_scope: str = "shared",
     meta_grad_clip: Optional[float] = None,
@@ -110,6 +114,14 @@ def run_meta_training(
         "outer_per_source": outer_per_source,
         "hard_outer_sources": list(hard_outer_sources) if hard_outer_sources is not None else None,
         "outer_source_weights": dict(outer_source_weights) if outer_source_weights is not None else None,
+        "outer_schedule": outer_schedule,
+        "outer_schedule_first_frac": outer_schedule_first_frac,
+        "outer_schedule_first_source_weights": (
+            dict(outer_schedule_first_source_weights) if outer_schedule_first_source_weights is not None else None
+        ),
+        "outer_schedule_second_source_weights": (
+            dict(outer_schedule_second_source_weights) if outer_schedule_second_source_weights is not None else None
+        ),
         "inner_batch_scope": inner_batch_scope,
         "outer_batch_scope": outer_batch_scope,
         "meta_grad_clip": meta_grad_clip,
@@ -170,6 +182,10 @@ def run_meta_training(
         outer_per_source=outer_per_source,
         hard_outer_sources=hard_outer_sources,
         outer_source_weights=outer_source_weights,
+        outer_schedule=outer_schedule,
+        outer_schedule_first_frac=outer_schedule_first_frac,
+        outer_schedule_first_source_weights=outer_schedule_first_source_weights,
+        outer_schedule_second_source_weights=outer_schedule_second_source_weights,
         inner_batch_scope=inner_batch_scope,
         outer_batch_scope=outer_batch_scope,
         meta_grad_clip=meta_grad_clip,
