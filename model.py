@@ -1561,6 +1561,9 @@ def _compute_score_grad_diagnostics(
 def train_datarater(
     train_loader,
     val_loader,
+    train_loader_folds=None,
+    val_loader_folds=None,
+    phase2_kfold: int = 0,
     meta_lr: float = 1e-4,
     n_meta_steps: int = 5000,
     n_inner_models: int = 8,
@@ -1691,6 +1694,13 @@ def train_datarater(
             raise ValueError("score_source_bias_penalty_coef must be non-negative.")
         if score_grad_log_interval < 0:
             raise ValueError("score_grad_log_interval must be non-negative.")
+        if phase2_kfold not in {0, 1}:
+            if phase2_kfold < 2:
+                raise ValueError("phase2_kfold must be 0/1 (disabled) or >= 2.")
+            if not train_loader_folds or not val_loader_folds:
+                raise ValueError("phase2_kfold requires train_loader_folds and val_loader_folds.")
+            if len(train_loader_folds) != int(phase2_kfold) or len(val_loader_folds) != int(phase2_kfold):
+                raise ValueError("phase2_kfold must match the number of fold loaders.")
         if inner_source_weight_cap:
             for src_name, cap_value in inner_source_weight_cap.items():
                 if float(cap_value) < 0.0:
@@ -1825,8 +1835,24 @@ def train_datarater(
                     assigned_member["seed"],
                 )
 
-        train_iter = iter(train_loader)
-        val_iter = iter(val_loader)
+        current_train_loader = train_loader
+        current_val_loader = val_loader
+        current_fold_idx = 0
+        fold_span = None
+        if phase2_kfold and phase2_kfold > 1:
+            fold_span = max(1, int(math.ceil(float(n_meta_steps) / float(phase2_kfold))))
+            current_train_loader = train_loader_folds[0]
+            current_val_loader = val_loader_folds[0]
+            logger.info(
+                "[meta] phase2_kfold=%d | fold_span=%d | initial_fold=1/%d | inner_batches=%d | outer_batches=%d",
+                int(phase2_kfold),
+                int(fold_span),
+                int(phase2_kfold),
+                len(current_train_loader),
+                len(current_val_loader),
+            )
+        train_iter = iter(current_train_loader)
+        val_iter = iter(current_val_loader)
         outer_sampler_cache: Dict[tuple, Optional[Dict[str, object]]] = {}
         prev_outer_schedule_stage_name: Optional[str] = None
 
@@ -1852,7 +1878,7 @@ def train_datarater(
             )
             if sampler_key not in outer_sampler_cache:
                 outer_sampler_cache[sampler_key] = _build_outer_sampler(
-                    val_loader=val_loader,
+                    val_loader=current_val_loader,
                     val_raw=val_raw,
                     outer_sampling=current_sampling,
                     outer_per_source=outer_per_source,
@@ -1895,6 +1921,23 @@ def train_datarater(
         prev_meta_lr_scale: Optional[float] = None
 
         for step in range(n_meta_steps):
+            if phase2_kfold and phase2_kfold > 1:
+                requested_fold_idx = min(int(step // fold_span), int(phase2_kfold) - 1)
+                if requested_fold_idx != current_fold_idx:
+                    current_fold_idx = requested_fold_idx
+                    current_train_loader = train_loader_folds[current_fold_idx]
+                    current_val_loader = val_loader_folds[current_fold_idx]
+                    train_iter = iter(current_train_loader)
+                    val_iter = iter(current_val_loader)
+                    outer_sampler_cache = {}
+                    logger.info(
+                        "[meta] step %d phase2 fold -> %d/%d | inner_batches=%d | outer_batches=%d",
+                        step + 1,
+                        current_fold_idx + 1,
+                        int(phase2_kfold),
+                        len(current_train_loader),
+                        len(current_val_loader),
+                    )
             current_outer_sampler, current_outer_sampling, current_outer_source_weights, outer_schedule_info = get_outer_sampler_for_step(step)
             current_outer_schedule_stage_name = (
                 outer_schedule_info["stage"] if outer_schedule_info is not None else None
@@ -1969,13 +2012,13 @@ def train_datarater(
             if inner_batch_scope == "shared":
                 shared_inner_batches = []
                 for _ in range(T_window):
-                    x_in, train_iter = _next_batch(train_iter, train_loader)
+                    x_in, train_iter = _next_batch(train_iter, current_train_loader)
                     shared_inner_batches.append(x_in)
 
             shared_outer_batch = None
             if outer_batch_scope == "shared":
                 if current_outer_sampling == "random":
-                    shared_outer_batch, val_iter = _next_batch(val_iter, val_loader)
+                    shared_outer_batch, val_iter = _next_batch(val_iter, current_val_loader)
                 else:
                     shared_outer_batch = _sample_outer_batch(current_outer_sampler)
 
@@ -2013,7 +2056,7 @@ def train_datarater(
                 if shared_inner_batches is None:
                     inner_batches = []
                     for _ in range(T_window):
-                        x_in, train_iter = _next_batch(train_iter, train_loader)
+                        x_in, train_iter = _next_batch(train_iter, current_train_loader)
                         inner_batches.append(x_in)
                 else:
                     inner_batches = shared_inner_batches
@@ -2125,7 +2168,7 @@ def train_datarater(
 
                 if shared_outer_batch is None:
                     if current_outer_sampling == "random":
-                        x_out, val_iter = _next_batch(val_iter, val_loader)
+                        x_out, val_iter = _next_batch(val_iter, current_val_loader)
                     else:
                         x_out = _sample_outer_batch(current_outer_sampler)
                 else:

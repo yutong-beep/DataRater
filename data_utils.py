@@ -76,24 +76,15 @@ def _normalize_ppba_schema(df: pd.DataFrame, filename: str) -> pd.DataFrame:
 # ==========================================
 # Download & Split (Strict Whitelist)
 # ==========================================
-def download_and_split(
+def _load_ppba_dataframe(
     dataset_name: str = "Bindwell/PPBA",
-    train_ratio: float = 0.8,
-    seed: int = DEFAULT_SEED,
     cache_dir: Optional[str] = None,
-    mode: str = "combined_train",  # "combined_train" or "all" (excluding Combined_train)
+    mode: str = "combined_train",
     exclude_sources: Optional[List[str]] = None,
-) -> Tuple[Dataset, Dataset]:
+) -> pd.DataFrame:
     """
-    Strictly load dataset via hf_hub_download + pandas parquet reading,
-    avoiding HF dataset config pitfalls completely.
-
-    mode:
-      - "combined_train": only load Combined_train.parquet
-      - "all": load and concat all non-Combined parquet files
+    Load the requested PPBA subset into a single pandas DataFrame without splitting.
     """
-    logger.info(f"Downloading dataset (strict whitelist): {dataset_name} | mode={mode}")
-
     if mode not in {"combined_train", "all"}:
         raise ValueError("mode must be 'combined_train' or 'all'")
 
@@ -119,9 +110,9 @@ def download_and_split(
         if mode == "all":
             df = _normalize_ppba_schema(df, filename=fn)
         elif "source" not in df.columns:
-            # Keep multi-head/source-aware phase-2 runs working in combined_train mode.
             df = df.copy()
             df["source"] = fn.replace(".parquet", "")
+
         excluded_rows = 0
         if exclude_sources and "source" in df.columns:
             before = len(df)
@@ -146,7 +137,33 @@ def download_and_split(
             list(full_df.columns),
         )
         logger.info("[mode=all] pkd missing rate: %.4f", float(full_df["pkd"].isna().mean()))
+    return full_df
 
+
+def download_and_split(
+    dataset_name: str = "Bindwell/PPBA",
+    train_ratio: float = 0.8,
+    seed: int = DEFAULT_SEED,
+    cache_dir: Optional[str] = None,
+    mode: str = "combined_train",  # "combined_train" or "all" (excluding Combined_train)
+    exclude_sources: Optional[List[str]] = None,
+) -> Tuple[Dataset, Dataset]:
+    """
+    Strictly load dataset via hf_hub_download + pandas parquet reading,
+    avoiding HF dataset config pitfalls completely.
+
+    mode:
+      - "combined_train": only load Combined_train.parquet
+      - "all": load and concat all non-Combined parquet files
+    """
+    logger.info(f"Downloading dataset (strict whitelist): {dataset_name} | mode={mode}")
+
+    full_df = _load_ppba_dataframe(
+        dataset_name=dataset_name,
+        cache_dir=cache_dir,
+        mode=mode,
+        exclude_sources=exclude_sources,
+    )
     full = Dataset.from_pandas(full_df, preserve_index=False)
 
     logger.info(f"Total samples before splitting: {len(full)}")
@@ -158,6 +175,29 @@ def download_and_split(
 
     logger.info(f"Train (inner): {len(train_ds)} | Val (outer): {len(val_ds)}")
     return train_ds, val_ds
+
+
+def download_full_dataset(
+    dataset_name: str = "Bindwell/PPBA",
+    seed: int = DEFAULT_SEED,
+    cache_dir: Optional[str] = None,
+    mode: str = "combined_train",
+    exclude_sources: Optional[List[str]] = None,
+) -> Dataset:
+    """
+    Load the requested PPBA subset without splitting. The returned Dataset keeps
+    a stable row order determined by the parquet concatenation.
+    """
+    logger.info(f"Downloading full dataset without split: {dataset_name} | mode={mode}")
+    full_df = _load_ppba_dataframe(
+        dataset_name=dataset_name,
+        cache_dir=cache_dir,
+        mode=mode,
+        exclude_sources=exclude_sources,
+    )
+    full = Dataset.from_pandas(full_df, preserve_index=False)
+    logger.info("Full dataset ready: %d samples | columns=%s", len(full), full.column_names)
+    return full
 
 
 # ==========================================
@@ -420,6 +460,68 @@ def build_dataloaders(
         ),
     )
     return train_loader, val_loader
+
+
+def build_kfold_dataloaders(
+    full_ds: Dataset,
+    k_folds: int,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    num_workers: int = 2,
+    shuffle_train: bool = True,
+    seed: Optional[int] = None,
+    deterministic: bool = False,
+) -> Tuple[List[DataLoader], List[DataLoader]]:
+    """
+    Build fold-specific train/val loaders from a single tokenized dataset.
+    Each fold uses 1/K of the data as outer/val and the remaining K-1 folds as inner/train.
+    """
+    if int(k_folds) < 2:
+        raise ValueError("k_folds must be >= 2")
+    n = len(full_ds)
+    if n < int(k_folds):
+        raise ValueError(f"Dataset too small for k-fold: n={n}, k={k_folds}")
+
+    rng = random.Random(int(seed) if seed is not None else DEFAULT_SEED)
+    indices = list(range(n))
+    rng.shuffle(indices)
+
+    fold_sizes = [n // int(k_folds)] * int(k_folds)
+    for i in range(n % int(k_folds)):
+        fold_sizes[i] += 1
+
+    val_folds: List[List[int]] = []
+    cursor = 0
+    for fold_size in fold_sizes:
+        val_folds.append(indices[cursor:cursor + fold_size])
+        cursor += fold_size
+
+    train_loaders: List[DataLoader] = []
+    val_loaders: List[DataLoader] = []
+    for fold_idx, val_indices in enumerate(val_folds):
+        val_index_set = set(val_indices)
+        train_indices = [idx for idx in indices if idx not in val_index_set]
+        train_fold = full_ds.select(train_indices)
+        val_fold = full_ds.select(val_indices)
+        fold_seed = None if seed is None else int(seed) + 1000 + fold_idx * 17
+        train_loader, val_loader = build_dataloaders(
+            train_fold,
+            val_fold,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            shuffle_train=shuffle_train,
+            seed=fold_seed,
+            deterministic=deterministic,
+        )
+        train_loaders.append(train_loader)
+        val_loaders.append(val_loader)
+        logger.info(
+            "Built k-fold loaders | fold=%d/%d | inner=%d | outer=%d",
+            fold_idx + 1,
+            int(k_folds),
+            len(train_fold),
+            len(val_fold),
+        )
+    return train_loaders, val_loaders
 
 
 # ==========================================

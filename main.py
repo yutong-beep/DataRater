@@ -87,6 +87,8 @@ def parse_args():
     p.add_argument("--meta_batch_size", type=int, default=16,
                    help="Smaller batch size specifically for DataRater Meta-Training to prevent OOM (Phase 2)")
     p.add_argument("--train_ratio", type=float, default=0.8)
+    p.add_argument("--phase2_kfold", type=int, default=0,
+                   help="If >1, Phase 2 rotates across K held-out folds built from the full dataset; Phase 1/5 still use --train_ratio")
 
     # Phase 1 & 5: Baseline training
     p.add_argument("--epochs", type=int, default=10)
@@ -1042,31 +1044,73 @@ def main():
         logger.info("=" * 60)
 
         from meta_trainer import run_meta_training
-        from data_utils import build_dataloaders
+        from data_utils import (
+            build_dataloaders,
+            build_kfold_dataloaders,
+            download_full_dataset,
+            tokenize_dataset,
+        )
         hard_outer_sources = _parse_csv_arg(args.hard_outer_sources)
         outer_source_weights = _parse_weight_spec(args.outer_source_weights)
         outer_schedule_first_source_weights = _parse_weight_spec(args.outer_schedule_first_source_weights)
         outer_schedule_second_source_weights = _parse_weight_spec(args.outer_schedule_second_source_weights)
         inner_source_score_bias = _parse_weight_spec(args.inner_source_score_bias)
         inner_source_weight_cap = _parse_weight_spec(args.inner_source_weight_cap)
-        
-        # Build specialized dataloaders with smaller meta_batch_size to prevent OOM
-        logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
-        meta_train_loader, meta_val_loader = build_dataloaders(
-            train_dataset, val_dataset,
-            batch_size=args.meta_batch_size,
-            num_workers=args.num_workers,
-            seed=args.seed + 1000,
-            deterministic=args.strict_deterministic,
-        )
+        meta_train_loader_folds = None
+        meta_val_loader_folds = None
+        phase2_train_raw = train_raw_dataset
+        phase2_val_raw = val_raw_dataset
+        phase2_train_dataset = train_dataset
+
+        if int(args.phase2_kfold) > 1:
+            logger.info(
+                "Building Phase-2 k-fold loaders (k=%d) from the full dataset | meta_batch_size=%d",
+                int(args.phase2_kfold),
+                int(args.meta_batch_size),
+            )
+            full_raw_dataset = download_full_dataset(
+                dataset_name=args.dataset,
+                seed=args.seed,
+                mode=args.data_mode,
+                exclude_sources=_parse_csv_arg(args.exclude_sources),
+            )
+            full_tokenized_dataset = tokenize_dataset(
+                full_raw_dataset,
+                max_length=args.max_length,
+            )
+            meta_train_loader_folds, meta_val_loader_folds = build_kfold_dataloaders(
+                full_tokenized_dataset,
+                k_folds=int(args.phase2_kfold),
+                batch_size=args.meta_batch_size,
+                num_workers=args.num_workers,
+                seed=args.seed + 1000,
+                deterministic=args.strict_deterministic,
+            )
+            meta_train_loader = meta_train_loader_folds[0]
+            meta_val_loader = meta_val_loader_folds[0]
+            phase2_train_raw = full_raw_dataset
+            phase2_val_raw = full_raw_dataset
+            phase2_train_dataset = full_tokenized_dataset
+        else:
+            logger.info(f"Building specific DataLoaders for Meta-Training (Batch Size: {args.meta_batch_size})")
+            meta_train_loader, meta_val_loader = build_dataloaders(
+                train_dataset, val_dataset,
+                batch_size=args.meta_batch_size,
+                num_workers=args.num_workers,
+                seed=args.seed + 1000,
+                deterministic=args.strict_deterministic,
+            )
 
         phase2_dir = os.path.join(run_dir, "phase2_datarater")
         meta_result = run_meta_training(
             train_loader=meta_train_loader,
             val_loader=meta_val_loader,
-            train_raw=train_raw_dataset,
-            val_raw=val_raw_dataset,
-            train_dataset=train_dataset,
+            train_loader_folds=meta_train_loader_folds,
+            val_loader_folds=meta_val_loader_folds,
+            phase2_kfold=int(args.phase2_kfold),
+            train_raw=phase2_train_raw,
+            val_raw=phase2_val_raw,
+            train_dataset=phase2_train_dataset,
             meta_lr=args.lr,
             n_meta_steps=args.meta_steps,
             n_inner_models=args.n_inner_models,

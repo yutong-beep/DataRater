@@ -27,6 +27,9 @@ def run_meta_training(
     val_loader: DataLoader,
     train_raw,
     val_raw,
+    train_loader_folds=None,
+    val_loader_folds=None,
+    phase2_kfold: int = 0,
     train_dataset=None,
     meta_lr: float = 1e-4,
     n_meta_steps: int = 5000,
@@ -94,6 +97,7 @@ def run_meta_training(
 
     config = {
         "n_meta_steps": n_meta_steps,
+        "phase2_kfold": int(phase2_kfold),
         "meta_lr": meta_lr,
         "n_inner_models": n_inner_models,
         "lifetime": lifetime,
@@ -158,6 +162,8 @@ def run_meta_training(
     logger.info(f"Config: {json.dumps(config, indent=2)}")
     logger.info(f"Train loader: {len(train_loader)} batches")
     logger.info(f"Val loader: {len(val_loader)} batches")
+    if phase2_kfold and phase2_kfold > 1:
+        logger.info("Phase 2 k-fold enabled: %d folds", int(phase2_kfold))
 
     t0 = time.time()
 
@@ -165,6 +171,9 @@ def run_meta_training(
     data_rater = train_datarater(
         train_loader=train_loader,
         val_loader=val_loader,
+        train_loader_folds=train_loader_folds,
+        val_loader_folds=val_loader_folds,
+        phase2_kfold=phase2_kfold,
         meta_lr=meta_lr,
         n_meta_steps=n_meta_steps,
         n_inner_models=n_inner_models,
